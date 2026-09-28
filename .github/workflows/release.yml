@@ -1,0 +1,252 @@
+name: Release Workflow
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Write scopes are granted per job, only where the job actually publishes
+# something. Everything else runs read-only.
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # xprem is the canonical image. The expo-open-ota path is kept in sync so
+      # deployments made under the old project name keep pulling.
+      - name: Build and push multi-platform Docker image
+        id: build
+        run: |
+          IMAGE_TAG="${GITHUB_REF#refs/tags/}"
+          REPO="ghcr.io/${{ github.repository_owner }}/xprem"
+          DEPRECATED_REPO="ghcr.io/${{ github.repository_owner }}/expo-open-ota"
+
+          echo "Building Docker image with tag: $IMAGE_TAG"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION="$IMAGE_TAG" \
+            -t "$REPO:$IMAGE_TAG" \
+            -t "$DEPRECATED_REPO:$IMAGE_TAG" \
+            --metadata-file /tmp/meta.json \
+            --push .
+          echo "digest=$(jq -r '."containerimage.digest"' /tmp/meta.json)" >> "$GITHUB_OUTPUT"
+
+  helm:
+    runs-on: ubuntu-latest
+    needs: docker
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      xprem_digest: ${{ steps.push.outputs.xprem_digest }}
+      expo_open_ota_digest: ${{ steps.push.outputs.expo_open_ota_digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Update Helm values.yaml
+        run: |
+          IMAGE_TAG="${GITHUB_REF#refs/tags/}"
+          sed -i "s/tag: .*/tag: ${IMAGE_TAG}/" helm/values.yaml
+
+      # xprem is the canonical chart. A byte-identical copy goes out under the
+      # old chart name so `helm upgrade` on existing releases keeps resolving.
+      - name: Package Helm chart
+        run: |
+          IMAGE_TAG="${GITHUB_REF#refs/tags/}"
+          CHART_VERSION="${IMAGE_TAG#v}"
+          helm package ./helm -d ./charts --version "$CHART_VERSION" --app-version "$IMAGE_TAG"
+          sed -i 's/^name: xprem$/name: expo-open-ota/' helm/Chart.yaml
+          helm package ./helm -d ./charts --version "$CHART_VERSION" --app-version "$IMAGE_TAG"
+          sed -i 's/^name: expo-open-ota$/name: xprem/' helm/Chart.yaml
+
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push Helm chart to GHCR
+        id: push
+        run: |
+          IMAGE_TAG="${GITHUB_REF#refs/tags/}"
+          CHART_VERSION="${IMAGE_TAG#v}"
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          for CHART in xprem expo-open-ota; do
+            DIGEST=$(helm push "./charts/${CHART}-${CHART_VERSION}.tgz" "oci://ghcr.io/${OWNER}/charts" 2>&1 | tee /dev/stderr | sed -n 's/^Digest: //p')
+            echo "${CHART//-/_}_digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          done
+
+      # Only the canonical chart ships as a release asset; the deprecated copy
+      # exists for `helm upgrade` and has no reason to appear on the release.
+      - name: Rename chart archive for release assets
+        run: |
+          IMAGE_TAG="${GITHUB_REF#refs/tags/}"
+          CHART_VERSION="${IMAGE_TAG#v}"
+          rm -f "./charts/expo-open-ota-${CHART_VERSION}.tgz"
+          mv "./charts/xprem-${CHART_VERSION}.tgz" "./charts/xprem-helm-charts-${IMAGE_TAG}.tgz"
+
+      - name: Upload chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: ./charts/*.tgz
+
+  sign:
+    runs-on: ubuntu-latest
+    needs: [docker, helm]
+    # cosign keyless signs through Sigstore and needs an OIDC token.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # GHCR has no OCI referrers API, so signatures use the legacy .sig tag layout.
+      - name: Sign Docker images and Helm charts
+        env:
+          IMAGE_DIGEST: ${{ needs.docker.outputs.digest }}
+          XPREM_CHART_DIGEST: ${{ needs.helm.outputs.xprem_digest }}
+          EXPO_OPEN_OTA_CHART_DIGEST: ${{ needs.helm.outputs.expo_open_ota_digest }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          for DIGEST in "$IMAGE_DIGEST" "$XPREM_CHART_DIGEST" "$EXPO_OPEN_OTA_CHART_DIGEST"; do
+            if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Missing or malformed digest: '$DIGEST'"
+              exit 1
+            fi
+          done
+          REFS="ghcr.io/$OWNER/xprem@$IMAGE_DIGEST \
+                ghcr.io/$OWNER/expo-open-ota@$IMAGE_DIGEST \
+                ghcr.io/$OWNER/charts/xprem@$XPREM_CHART_DIGEST \
+                ghcr.io/$OWNER/charts/expo-open-ota@$EXPO_OPEN_OTA_CHART_DIGEST"
+          cosign sign --yes --new-bundle-format=false --use-signing-config=false $REFS
+
+          for REF in $REFS; do
+            cosign verify "$REF" \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+              --certificate-identity="https://github.com/$WORKFLOW_REF"
+          done
+
+  npm:
+    runs-on: ubuntu-latest
+    # npm publish --provenance signs through Sigstore and needs an OIDC token.
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      # One package must not stop the other from being published, and a partial
+      # release is easier to finish than to unpick.
+      fail-fast: false
+      matrix:
+        include:
+          - package: apps/eoas
+            build: true
+          - package: apps/control-center
+            build: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
+          registry-url: "https://registry.npmjs.org"
+
+      # REF_NAME goes through env rather than a ${{ }} interpolation inside the
+      # script: git allows quotes and semicolons in tag names, so interpolating
+      # one straight into the shell would let whoever pushes the tag run
+      # arbitrary commands in this job, which holds the npm publishing identity.
+      - name: Publish NPM package
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          PACKAGE_DIR: ${{ matrix.package }}
+          NEEDS_BUILD: ${{ matrix.build }}
+        run: |
+          cd "$PACKAGE_DIR"
+          VERSION="${REF_NAME#v}"
+          # ci only where a lockfile makes it reproducible; the picker package
+          # has none, and ci refuses to run without one.
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          if [ "$NEEDS_BUILD" = "true" ]; then
+            npm run build
+          fi
+          # Ships TypeScript sources, so the compiler is the only thing standing
+          # between a broken package and everyone who installs it.
+          npm run typecheck --if-present
+          # Fails here rather than on the registry if the files list is wrong,
+          # and prints exactly what a consumer would receive.
+          npm pack --dry-run
+          npm version "$VERSION" --no-git-tag-version
+
+          if echo "$VERSION" | grep -qE '\-(alpha|beta|rc)'; then
+            NPM_TAG=$(echo "$VERSION" | grep -oE '(alpha|beta|rc)')
+            echo "Pre-release detected, publishing with --tag $NPM_TAG"
+            npm publish --access public --provenance --tag "$NPM_TAG"
+          else
+            npm publish --access public --provenance
+          fi
+
+  github-release:
+    runs-on: ubuntu-latest
+    needs: [sign, npm]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download chart artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: helm-chart
+          path: ./charts
+
+      - name: Compute release metadata
+        run: |
+          IMAGE_TAG="${GITHUB_REF#refs/tags/}"
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "CHART_VERSION=${IMAGE_TAG#v}" >> "$GITHUB_ENV"
+          echo "OWNER=$OWNER" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ./charts/*.tgz
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+          body: |
+            ## Changes
+            - Docker image: `ghcr.io/${{ github.repository_owner }}/xprem:${{ github.ref_name }}`
+            - Helm chart: `helm install xprem oci://ghcr.io/${{ env.OWNER }}/charts/xprem --version ${{ env.CHART_VERSION }}`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

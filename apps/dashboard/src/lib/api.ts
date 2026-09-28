@@ -1,0 +1,1854 @@
+import { getRefreshToken, getToken, logout, saveReturnTo, setTokens } from '@/lib/auth.ts';
+import { dashboardBasename } from '@/lib/basename.ts';
+
+export type APIProblemPayload = {
+  title: string;
+  status: number;
+  detail: string;
+};
+
+export class ApiProblemError extends Error {
+  public title: string;
+  public status: number;
+  public detail: string;
+
+  constructor(payload: APIProblemPayload) {
+    super(payload.detail);
+    this.name = 'ApiProblemError';
+    this.title = payload.title;
+    this.status = payload.status;
+    this.detail = payload.detail;
+  }
+}
+
+// Turns any thrown error into a toast-ready title/description pair: an
+// ApiProblemError carries the server's actionable message, anything else
+// falls back to the given title.
+export const describeApiError = (
+  error: unknown,
+  fallbackTitle: string
+): { title: string; description: string } => {
+  if (error instanceof ApiProblemError) {
+    return { title: error.title, description: error.detail };
+  }
+  return {
+    title: fallbackTitle,
+    description: error instanceof Error ? error.message : 'An unexpected error occurred.',
+  };
+};
+
+export type KeysMode = 'local' | 'aws-secrets-manager' | 'environment' | 'database';
+
+export type KeysConfig = {
+  mode: KeysMode;
+  publicPath?: string;
+  privatePath?: string;
+  publicSecretId?: string;
+  privateSecretId?: string;
+  publicB64?: string;
+  privateB64?: string;
+  sealedPublicKey?: string;
+  sealedPrivateKey?: string;
+};
+
+export type AppDescriptor = {
+  id: string;
+  name?: string;
+};
+
+// One audit log entry, as served by GET /api/audit/events. Displays are
+// denormalized snapshots taken at write time: they keep rendering after the
+// actor or target they name is deleted.
+export type AuditEventRecord = {
+  id: number;
+  occurredAt: string;
+  actorType: 'user' | 'api_key' | 'system' | '';
+  actorId?: string;
+  actorDisplay: string;
+  action: string;
+  targetType: string;
+  targetId: string;
+  targetDisplay: string;
+  appId?: string;
+  outcome: 'success' | 'denied' | 'failure' | '';
+  ip?: string;
+  userAgent?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type AuditEventsQuery = {
+  actorId?: string;
+  action?: string;
+  appId?: string;
+  outcome?: string;
+  from?: string;
+  to?: string;
+  beforeId?: number;
+  limit?: number;
+};
+
+export type AuditEventsPage = {
+  events: AuditEventRecord[];
+  // The cursor of the next page; null/absent on the last one. Sent back
+  // verbatim as beforeId.
+  nextCursor?: number | null;
+  // The filtered total, cursor excluded.
+  count: number;
+};
+
+export type AppDetails = AppDescriptor & {
+  keys: KeysConfig;
+  gitUrl?: string;
+  createdAt?: number;
+};
+
+export type CreateAppPayload = {
+  name: string;
+  keysConfig: KeysConfig;
+};
+
+export type ExpoImportableApp = {
+  id: string;
+  name: string;
+  fullName: string;
+};
+
+export type ExpoAccountApps = {
+  accountId: string;
+  accountName: string;
+  apps: ExpoImportableApp[];
+};
+
+export type ExpoImportPayload = {
+  expoAppId: string;
+  keysConfig: KeysConfig;
+  // Newest EAS update groups to also copy in a background job; omit for none.
+  historyLimit?: number;
+};
+
+export type ExpoImportResult = {
+  appId: string;
+  name: string;
+  branchCount: number;
+  channelCount: number;
+  skipped?: string[];
+  warnings?: string[];
+  historyJobId?: string;
+};
+
+export type ExpoImportPlanItem = {
+  name: string;
+  // Channels only: the branch the channel will map to.
+  mappedBranch?: string;
+  skipReason?: string;
+  // Set when the entry will be created with a caveat.
+  warning?: string;
+};
+
+export type ExpoImportPlan = {
+  appId: string;
+  name: string;
+  expoName: string;
+  // Set when the import cannot run at all.
+  conflict?: string;
+  branches: ExpoImportPlanItem[];
+  channels: ExpoImportPlanItem[];
+};
+
+export type ExpoHistoryJobStatus = {
+  state: 'running' | 'done' | 'failed' | 'canceled';
+  total: number;
+  processed: number;
+  imported: number;
+  skipped?: string[];
+  error?: string;
+  cancelRequested: boolean;
+};
+
+export type BranchUpdateState = {
+  runtimeVersion: string;
+  commitHash: string;
+  createdAt: string;
+  rolloutPercentage?: number | null;
+};
+
+export type BranchRecord = {
+  branchName: string;
+  branchId: string;
+  releaseChannel?: string | null;
+  createdAt: string | null;
+  // Branch protection: a protected branch refuses to be deleted. It says
+  // nothing about what may be published on it, which is decided per API token.
+  // Always false in stateless mode.
+  protected: boolean;
+  currentUpdate?: BranchUpdateState | null;
+};
+
+// An active channel rollout. Serves `rolloutBranchName` to `percentage`% of
+// devices on the channel and `defaultBranchName` to the rest. `id` doubles as
+// the bucketing salt on the server. Present only in control-plane mode.
+export type ChannelRolloutRecord = {
+  id: string;
+  channelName: string;
+  defaultBranchName: string;
+  rolloutBranchName: string;
+  percentage: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ChannelRecord = {
+  releaseChannelId: string;
+  releaseChannelName: string;
+  branchName?: string | null;
+  branchId?: string | null;
+  createdAt: string | null;
+  // Set while a progressive rollout is active on the channel; null/absent
+  // otherwise. The channels list carries it so the table needs no extra call.
+  rollout?: ChannelRolloutRecord | null;
+  branchCurrentUpdate?: BranchUpdateState | null;
+  rolloutBranchCurrentUpdate?: BranchUpdateState | null;
+  // Absent in stateless mode, where the setting does not exist.
+  branchSurfing?: BranchSurfingRecord | null;
+};
+
+// Which branches a device polling this channel may ask to be served instead of
+// the mapped one. Pattern is a glob: "*" stands for any run of characters.
+export type BranchSurfingRecord = {
+  enabled: boolean;
+  pattern: string;
+};
+
+export type RuntimeVersionRecord = {
+  runtimeVersion: string;
+  lastUpdatedAt: string;
+  createdAt: string;
+  numberOfUpdates: number;
+  // True when a per-update rollout is active on any update of this runtime
+  // version. Optional: only shipped by the control plane.
+  activeRollout?: boolean;
+  rolloutPercentage?: number | null;
+};
+
+// A published update. `rolloutPercentage` is set only while this exact update
+// is being progressively rolled out; `controlUpdateId` points at the update
+// out-of-bucket devices keep receiving during (and as a historical marker
+// after) that rollout. Both are absent in stateless mode.
+export type UpdateRecord = {
+  updateUUID: string;
+  createdAt: string;
+  updateId: string;
+  platform: string;
+  commitHash: string;
+  message?: string;
+  rolloutPercentage?: number | null;
+  controlUpdateId?: string | null;
+  publishGroup?: string | null;
+};
+
+export type UpdateFeedRecord = UpdateRecord & {
+  branch: string;
+  runtimeVersion: string;
+};
+
+export type UpdateFeedQuery = {
+  branch?: string;
+  runtimeVersion?: string;
+  platform?: string;
+  uuid?: string;
+  groupId?: string;
+  commitHash?: string;
+  from?: string;
+  to?: string;
+  cursor?: string;
+  limit?: number;
+};
+
+export type UpdateFeedPage = {
+  items: UpdateFeedRecord[];
+  nextCursor?: string;
+};
+
+// What a republish or a rollback created: one row per platform it acted on.
+// `publishGroup` is the new group a group republish minted for its rows, absent
+// everywhere else.
+export type PublishResult = {
+  updates: { updateId: string; branch: string; runtimeVersion: string }[];
+  publishGroup?: string;
+};
+
+export type UpdatesPage = {
+  items: UpdateRecord[];
+  nextCursor: string | null;
+};
+
+// One active per-update rollout row (eoas publishes one per platform, so a
+// single rollout on a runtime version can have up to two rows).
+export type UpdateRolloutInfo = {
+  updateId: string;
+  platform: string;
+  percentage: number;
+  controlUpdateId?: string | null;
+  createdAt: string;
+};
+
+// Instant-T health of one update, from the device registry (Postgres only,
+// no ClickHouse needed). A manifest rollback is faulty but no longer current;
+// a JS crash is faulty and still current. successfulDevices removes that
+// overlap so healthPercent remains successes/(successes+faulty).
+export type UpdateHealthRecord = {
+  devicesOnUpdate: number;
+  successfulDevices: number;
+  faultyDevices: number;
+  healthPercent: number | null;
+};
+
+export type UpdateHealthHistoryPoint = {
+  timestamp: string;
+  capturedAt: string;
+  // 'legacy' is an update the fleet is still on but that no longer heads its
+  // branch: its health is settled, its adoption is the answer to "who is
+  // stuck on the old version".
+  role: 'current' | 'candidate' | 'control' | 'legacy';
+  devicesOnUpdate: number;
+  successfulDevices: number;
+  faultyDevices: number;
+  updateIssues: number;
+  runtimeIssues: number;
+  healthPercent: number | null;
+};
+
+// Same curves, split by a device dimension. Keys are segment values instead
+// of update ids, rebuilt from the raw health events since the snapshots are
+// pre-aggregated per update.
+export type UpdateHealthSegmentPoint = {
+  timestamp: string;
+  devicesOnUpdate: number;
+  successfulDevices: number;
+  faultyDevices: number;
+  healthPercent: number | null;
+};
+
+export type UpdateHealthSegmentsResponse = {
+  available: boolean;
+  dimension: string;
+  segments: Record<string, UpdateHealthSegmentPoint[]>;
+};
+
+// What PostgreSQL alone can reconstruct, served when the deployment runs no
+// ClickHouse. Two counts, and only one of them is honest about the past, which
+// is why they are named for what they measure rather than for the curve they
+// happen to draw.
+export type UpdateStateHistoryPoint = {
+  timestamp: string;
+  // Devices running this update TODAY, placed at the moment each arrived on
+  // it. Rises only: nothing records when a device leaves an update, so one
+  // that has moved away is absent from the whole curve, including the stretch
+  // where it really was running this update.
+  arrivedDevices: number;
+  // Devices with an unresolved fault at that instant. Exact, and free to fall:
+  // faults carry both ends.
+  failingDevices: number;
+};
+
+// Discriminated on `source`, deliberately. The two payloads answer different
+// questions and their fields are named differently for the same reason, so a
+// caller that forgets to branch fails to read the data rather than drawing one
+// under the other's labels.
+export type UpdateHealthHistoryResponse =
+  | {
+      available: boolean;
+      source?: 'projected' | 'none';
+      updates: Record<string, UpdateHealthHistoryPoint[]>;
+    }
+  | {
+      available: boolean;
+      source: 'state';
+      updates: Record<string, UpdateStateHistoryPoint[]>;
+    };
+
+export type IdentityValueType = 'string' | 'number' | 'boolean';
+
+export type IdentitySchemaKey = {
+  key: string;
+  type: IdentityValueType;
+  maxLength: number;
+};
+
+export type IdentityValueSuggestion = {
+  value: string;
+  deviceCount: number;
+};
+
+// Every dimension is a list: one value filters, several compare. Sent as
+// repeated query parameters rather than a separated string, because an Apple
+// hardware identifier carries a comma of its own ("iPhone18,2").
+export type ObserveQuery = {
+  from?: string;
+  to?: string;
+  platform?: Array<'ios' | 'android'>;
+  updateId?: string[];
+  updateGroupId?: string[];
+  branch?: string[];
+  runtimeVersion?: string[];
+  channel?: string[];
+  easClientId?: string[];
+  appVersion?: string[];
+  appBuildNumber?: string[];
+  easBuildId?: string[];
+  environment?: string[];
+  // Hardware and OS, straight from the telemetry resource attributes. They are
+  // what turns "the app is slow" into "the app is slow on old Android phones".
+  osName?: string[];
+  osVersion?: string[];
+  deviceModel?: string[];
+  // Country frozen on the row at ingestion, not the device's current country.
+  countryCode?: string[];
+  // Identity attributes as `key:value` pairs. Repeating a key widens it
+  // ("plan is pro or enterprise"), naming another key narrows further ("and
+  // tenant is globex").
+  attr?: string[];
+  // The state the device reported for a measurement, read from the params its
+  // client attached. Honored by the timing reads only: nothing else holds them.
+  // The values are the segment names the split produced, bucket labels
+  // included, so a row of a breakdown filters on exactly what it displayed.
+  thermalState?: string[];
+  lowPowerMode?: string[];
+  networkType?: string[];
+  frozenFrames?: string[];
+  networkBytes?: string[];
+};
+
+// What the Postgres device registry can be asked. Narrower than ObserveQuery
+// on purpose: the build dimensions and the channel exist in telemetry only, and
+// there is no time range because the registry answers on its own window.
+export type IdentityDeviceQuery = Pick<
+  ObserveQuery,
+  | 'platform'
+  | 'branch'
+  | 'runtimeVersion'
+  | 'updateId'
+  | 'updateGroupId'
+  | 'easClientId'
+  | 'osName'
+  | 'osVersion'
+  | 'deviceModel'
+  | 'countryCode'
+  | 'attr'
+>;
+
+// Query parameters for an ObserveQuery: scalars are set, lists are appended
+// once per value.
+export const observeSearchParams = (query: ObserveQuery): URLSearchParams => {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (Array.isArray(value)) {
+      for (const entry of value) if (entry) search.append(key, String(entry));
+    } else if (value) {
+      search.set(key, String(value));
+    }
+  }
+  return search;
+};
+
+// A registered device. Hardware and OS are absent until the device sends
+// telemetry; branch, runtime and platform are joined from the update it runs,
+// so they are absent for the embedded bundle.
+export type IdentityDevice = {
+  easClientId: string;
+  metadata: Record<string, unknown>;
+  countryCode?: string;
+  city?: string;
+  // City centroid, absent whenever GeoLite2 resolved a country but not a city.
+  lat?: number;
+  lng?: number;
+  deviceModel?: string;
+  osName?: string;
+  osVersion?: string;
+  currentUpdateId?: string;
+  branch?: string;
+  runtimeVersion?: string;
+  platform?: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+};
+
+export type IdentityDevicePage = {
+  devices: IdentityDevice[];
+  nextCursor?: string | null;
+};
+
+// One row of "who is this metric slow for". `values` are the raw column values
+// and double as the filters to drill in with; `contexts` qualify them when they
+// mean nothing alone (an OS version without its OS name).
+export type ObserveBreakdownSegment = {
+  // The raw column value this segment groups on, kept apart from any display
+  // label so drilling in never means parsing a label back into filters.
+  value: string;
+  // Qualifies the value where it means nothing alone: an OS version of "18.6"
+  // only reads next to its OS name.
+  context?: string;
+  devices: number;
+  samples: number;
+  p50: number;
+  p90: number;
+  points?: Array<{ timestamp: string; value: number }>;
+};
+
+export type ObserveBreakdownDimension =
+  | 'deviceModel'
+  | 'osVersion'
+  | 'osName'
+  | 'appVersion'
+  | 'appBuildNumber'
+  | 'updateGroup'
+  | 'route'
+  | 'country'
+  | 'branch'
+  | 'runtimeVersion'
+  | 'channel'
+  | 'environment'
+  | 'platform'
+  // The conditions the device was in, read from the params the client attaches
+  // to a timing. Present on the interactive timings only.
+  | 'thermalState'
+  | 'networkType'
+  | 'lowPowerMode'
+  | 'frozenFrames'
+  | 'networkBytes';
+
+export type ObserveConditionDefinition = {
+  name: ObserveBreakdownDimension;
+  values: string[];
+  // Read off the session rather than off the measurement, so every timing can
+  // be split and filtered by it instead of only the one that reports it.
+  sessionScoped?: boolean;
+};
+
+export type ObserveBreakdown = {
+  available: boolean;
+  metric: string;
+  dimension: ObserveBreakdownDimension;
+  segments: ObserveBreakdownSegment[];
+  // Same metric, same filters, no grouping: the baseline each segment is read
+  // against.
+  overall: ObserveBreakdownSegment;
+};
+
+export type ObserveMetric = {
+  id: string;
+  name: string;
+  label: string;
+  // One sentence on what the timing measures, served with the definition so
+  // the dashboard does not restate what a client decides.
+  description?: string;
+  unit: string;
+  category: 'startup' | 'updates' | 'navigation' | 'custom';
+  minimumSdk: number;
+  stats: {
+    count: number;
+    median: number;
+    avg: number;
+    min: number;
+    max: number;
+    p90: number;
+    p99: number;
+    devices: number;
+    // Whether any sample carried the state the device was in. Only the timings
+    // measured while the app runs do, so this is what tells a condition split
+    // which cards it can answer for, instead of asking each of them.
+    reportsConditions?: boolean;
+  };
+  points: Array<{ timestamp: string; value: number }>;
+};
+
+export type ObserveOverview = {
+  available: boolean;
+  summary: {
+    users: number;
+    releases: number;
+    builds: number;
+    updates: number;
+    sessions: number;
+    events: number;
+    platforms: string[];
+  };
+  metrics: ObserveMetric[];
+  locations: Array<{
+    countryCode: string;
+    city: string;
+    lat: number;
+    lng: number;
+    deviceCount: number;
+  }>;
+};
+
+// How many devices checked in per city over one poll window. Same shape as the
+// overview's locations, so the map animates arrivals without a second geometry.
+export type ObserveCheckInFeed = {
+  cities: ObserveOverview['locations'];
+  cursor: string;
+  windowSeconds: number;
+  truncated: boolean;
+};
+
+export type ObserveEvent = {
+  name: string;
+  count: number;
+  users: number;
+  sessions: number;
+  points: Array<{ timestamp: string; count: number }>;
+};
+
+export type ObserveEvents = {
+  available: boolean;
+  events: ObserveEvent[];
+};
+
+export type ObserveLog = {
+  eventKey: string;
+  timestamp: string;
+  easClientId: string;
+  updateId: string;
+  branch: string;
+  channel: string;
+  runtimeVersion: string;
+  platform: string;
+  sessionId: string;
+  eventName: string;
+  severityNumber: number;
+  severityText: string;
+  isFatal: boolean;
+  body: string;
+  attributes: string;
+  osName: string;
+  osVersion: string;
+  deviceModel: string;
+  countryCode: string;
+  appVersion: string;
+  appBuildNumber: string;
+  easBuildId: string;
+  environment: string;
+  sdkVersion: string;
+};
+
+export type ObserveLogsPage = {
+  available: boolean;
+  logs: ObserveLog[];
+  nextCursor?: string;
+};
+
+export type ObserveLogsQuery = ObserveQuery & {
+  severity?: 'debug' | 'info' | 'warn' | 'error' | 'fatal' | '';
+  search?: string;
+  // Exact names, unlike `search` which also reads bodies and attributes.
+  eventName?: string[];
+  cursor?: string;
+  limit?: number;
+};
+
+export type UpdateDetailsRecord = {
+  updateUUID: string;
+  createdAt: string;
+  updateId: string;
+  platform: string;
+  commitHash: string;
+  message?: string;
+  type: number;
+  expoConfig: string;
+  rolloutPercentage?: number | null;
+  controlUpdateId?: string | null;
+};
+
+export type BundlePatchStatus =
+  'pending' | 'running' | 'stored' | 'skipped' | 'failed' | 'cancelled';
+
+// One bsdiff patch planned toward a target update from an earlier source
+// update (control-plane only, when bundle diffing is enabled). Sizes are set
+// once the patch was computed, whether it was stored or judged not worth it.
+export type BundlePatchRecord = {
+  targetUpdateId: string;
+  targetUpdateUUID: string;
+  sourceUpdateId: string;
+  sourceUpdateUUID: string;
+  sourceCommitHash: string;
+  sourceMessage?: string;
+  sourceCreatedAt: string;
+  status: BundlePatchStatus;
+  reason?: string;
+  patchSize?: number;
+  fullDownloadSize?: number;
+  attempts: number;
+  updatedAt: string;
+};
+
+export type ApiKeyRecord = {
+  id: string;
+  name: string;
+  hint: string;
+  createdAt: string;
+  lastUsedAt?: string | null;
+};
+
+export type CreateApiKeyResponse = {
+  apiKey: string;
+};
+
+// What one API token is allowed to do (/apiKeys/access, control-plane only).
+//
+// An empty branchRules means the token reaches EVERY branch, which is the
+// default of a fresh token and the only state a community deployment sees.
+// Empty allowedIps means it can be used from any source address.
+//
+// There is no separate say over creating a branch: publishing to a branch that
+// does not exist is how the CLI opens one, so a rule that admits the name
+// admits the creation.
+export type ApiKeyAccessRecord = {
+  apiKeyId: string;
+  branchRules: BranchRuleRecord[];
+  allowedIps: string[];
+};
+
+// One rule: a branch name or a "*" pattern, and what the token may do there.
+// Both writes imply read on the server, so a rule granting publish also grants
+// the reads eoas performs before publishing.
+export type BranchRuleRecord = {
+  pattern: string;
+  actions: BranchRuleAction[];
+};
+
+export type BranchRuleAction = 'read' | 'publish' | 'rollback';
+
+// A dashboard user account. `id` is empty in stateless mode, where the only
+// account comes from ADMIN_EMAIL and is not a database row. `lastConnectedAt`
+// is absent until the account's first successful sign-in.
+export type UserRecord = {
+  id: string;
+  email: string;
+  isAdmin: boolean;
+  // False for an account an admin revoked, or one awaiting approval under SSO
+  // manual validation. Disabled accounts cannot sign in.
+  enabled: boolean;
+  createdAt?: string;
+  lastConnectedAt?: string;
+};
+
+// A named permission bundle (enterprise user roles, ee/rbac). Roles are
+// global; they apply to an app only through a user's grant.
+export type RoleRecord = {
+  id: string;
+  name: string;
+  permissions: string[];
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+// One member's access to one app: an optional role plus direct extra
+// permissions. effectivePermissions is the server-computed union the
+// enforcement actually uses.
+export type GrantRecord = {
+  appId: string;
+  roleId: string | null;
+  roleName: string | null;
+  extraPermissions: string[];
+  effectivePermissions: string[];
+};
+
+// The deployment's Enterprise Edition license status (/api/license,
+// control-plane only). `valid` is the single source of truth for "enterprise
+// features are on": it stays true through the grace window while
+// `validationFailedAt` warns that the license server refuses or cannot be
+// reached, and flips to false (`suspended` true) once `graceEndsAt` passes.
+export type LicenseStatus = {
+  hasKey: boolean;
+  valid: boolean;
+  suspended?: boolean;
+  orgName?: string;
+  planCode?: string;
+  subscriptionStartAt?: string;
+  subscriptionEndAt?: string;
+  subscriptionRenewalAt?: string;
+  activatedAt?: string;
+  lastValidatedAt?: string;
+  validationFailedAt?: string;
+  validationErrorCode?: string;
+  graceEndsAt?: string;
+};
+
+// Outcome of the no-side-effect key check (/api/license/check): either valid
+// with the license descriptor to confirm before attaching, or an errorCode
+// saying why the key is not usable.
+export type LicenseCheckResult = {
+  valid: boolean;
+  errorCode?: string;
+  orgName?: string;
+  planCode?: string;
+  subscriptionStartAt?: string;
+  subscriptionEndAt?: string;
+  subscriptionRenewalAt?: string;
+};
+
+// Pre-auth SSO state (/auth/sso/config), read by the login page to decide
+// whether to render the SSO button. `enabled` is false for every possible
+// reason at once (not configured, toggled off, no valid license, stateless).
+export type SsoPublicConfig = {
+  enabled: boolean;
+  providerName?: string;
+};
+
+// Admin view of the SSO configuration (/api/sso). The client secret never
+// leaves the server: `hasClientSecret` only says whether one is stored, and
+// `redirectUri` is derived from BASE_URL for copy-pasting into the IdP.
+export type SsoSettings = {
+  issuer: string;
+  clientId: string;
+  hasClientSecret: boolean;
+  providerName: string;
+  scopes: string;
+  enabled: boolean;
+  allowedEmailDomains: string[];
+  allowedGroups: string[];
+  groupsClaim: string;
+  // Whether the server accepts an email the provider did not verify
+  // (email_verified false or absent) for account lookup and authorization.
+  trustUnverifiedEmail: boolean;
+  // Whether accounts discovered on their first SSO sign-in are provisioned
+  // disabled, waiting for an admin to approve them on the Users page.
+  manualUserValidation: boolean;
+  redirectUri: string;
+};
+
+// An empty `clientSecret` on an update means "keep the stored secret".
+export type SaveSsoSettingsPayload = {
+  issuer: string;
+  clientId: string;
+  clientSecret?: string;
+  providerName: string;
+  scopes: string;
+  enabled: boolean;
+  allowedEmailDomains: string[];
+  allowedGroups: string[];
+  groupsClaim: string;
+  trustUnverifiedEmail: boolean;
+  manualUserValidation: boolean;
+};
+
+// Mirror of the server's SettingsEnv payload (/api/settings). Field names are
+// the raw env-var spellings on purpose; the server is the source of truth.
+export type ServerSettings = {
+  BASE_URL: string;
+  SERVER_VERSION: string;
+  CONTROL_PLANE_ENABLED: boolean;
+  BUNDLE_DIFFING: boolean;
+  CACHE_MODE: string;
+  REDIS_HOST: string;
+  REDIS_PORT: string;
+  REDIS_SENTINEL_ADDRS: string;
+  REDIS_SENTINEL_MASTER_NAME: string;
+  STORAGE_MODE: string;
+  S3_BUCKET_NAME: string;
+  CDN_BASE_URL: string;
+  GCS_BUCKET_NAME: string;
+  AZURE_BLOB_CONTAINER_NAME: string;
+  AZURE_STORAGE_ACCOUNT_NAME: string;
+  LOCAL_BUCKET_BASE_PATH: string;
+  AWS_REGION: string;
+  AWS_BASE_ENDPOINT: string;
+  AWS_S3_FORCE_PATH_STYLE: string;
+  AWS_ACCESS_KEY_ID: string;
+  CLOUDFRONT_DOMAIN: string;
+  CLOUDFRONT_KEY_PAIR_ID: string;
+  PRIVATE_CLOUDFRONT_KEY_B64: string;
+  AWSSM_CLOUDFRONT_PRIVATE_KEY_SECRET_ID: string;
+  PRIVATE_CLOUDFRONT_KEY_PATH: string;
+  PROMETHEUS_ENABLED: string;
+  CDN_TYPE: '' | 'cloudfront' | 'gcs-direct' | 's3-direct' | 'azure-direct' | 'generic';
+  EXPO_ACCOUNT_USERNAME: string;
+  SSO_ENABLED: boolean;
+  APPS: { id: string; name?: string }[];
+};
+
+// All per-app routes (branches, channels, runtime versions, updates,
+// updateChannelBranchMapping) are scoped under /api/apps/{appId} on the
+// server. The dashboard keeps the currently-selected app id on the ApiClient
+// instance so call sites don't all have to pass it explicitly; the
+// SelectedAppContext is the single source of truth and calls setAppId()
+// whenever the user switches apps.
+export class ApiClient {
+  private baseUrl: string;
+  private appId: string | null = null;
+
+  constructor() {
+    this.baseUrl = window?.env?.VITE_OTA_API_URL || import.meta.env.VITE_OTA_API_URL;
+    if (!this.baseUrl) {
+      throw new Error('Missing VITE_OTA_API_URL environment variable');
+    }
+  }
+
+  public setAppId(appId: string | null) {
+    this.appId = appId;
+  }
+
+  public getAppId(): string | null {
+    return this.appId;
+  }
+
+  private appScope(): string {
+    if (!this.appId) {
+      // Guarded separately from the server 400 so the failure mode is a
+      // clear console error instead of a confusing "No app id provided"
+      // coming back from the server.
+      throw new Error(
+        'No app selected. Set one via SelectedAppContext before making app-scoped calls.'
+      );
+    }
+    return `/api/apps/${encodeURIComponent(this.appId)}`;
+  }
+
+  private populateHeaders(headers: Headers) {
+    const token = getToken();
+    if (token) {
+      headers.set('Authorization', `Bearer ${token}`);
+    }
+  }
+  // Every endpoint answers JSON except the certificate route, which serves a
+  // PEM. That one exception used to justify a second fetch site with its own
+  // copy of the auth handling below; naming the body format here keeps the
+  // retry, the token refresh and the error mapping in one place.
+  private async request<T>(
+    endpoint: string,
+    options: RequestInit = {},
+    parse: 'json' | 'text' = 'json'
+  ): Promise<T> {
+    const url = `${this.baseUrl}${endpoint}`;
+    // Rebuilt per attempt, so the retry below picks up the token the refresh
+    // just stored rather than the one that was already refused.
+    const send = () => {
+      const headers = new Headers(options.headers);
+      this.populateHeaders(headers);
+      return fetch(url, { ...options, headers });
+    };
+
+    let response = await send();
+    const refreshToken = getRefreshToken();
+    if (response.status === 401 && refreshToken) {
+      await this.refreshTokens(refreshToken);
+      // Exactly one retry, and it is the shape of the code that says so rather
+      // than a counter. It has to be bounded: a refresh that fails on an
+      // unreachable server deliberately keeps the tokens (see performRefresh),
+      // so a loop conditioned on "a token is present" would spin forever
+      // against a server that is down.
+      response = await send();
+    }
+
+    if (!response.ok) {
+      const contentType = response.headers.get('content-type');
+      if (contentType && contentType.includes('application/problem+json')) {
+        try {
+          const problemPayload = (await response.json()) as APIProblemPayload;
+          throw new ApiProblemError(problemPayload);
+        } catch (parseError) {
+          if (parseError instanceof ApiProblemError) throw parseError;
+        }
+      }
+      throw new Error(`HTTP error! Status: ${response.status}`);
+    }
+
+    if (response.status === 204) {
+      return (parse === 'text' ? '' : {}) as T;
+    }
+
+    return (parse === 'text' ? response.text() : response.json()) as Promise<T>;
+  }
+
+  // Refresh tokens are single-use on the server: presenting one retires it and
+  // returns a successor. A page typically has several requests in flight, so
+  // an access token expiring produces a burst of 401s that would each spend
+  // the same refresh token — the server tolerates that for a few seconds, but
+  // relying on its tolerance is not a design. This collapses the burst into
+  // one call every waiter shares.
+  private pendingRefresh: Promise<void> | null = null;
+
+  private async refreshTokens(refreshToken: string) {
+    if (this.pendingRefresh) {
+      return this.pendingRefresh;
+    }
+    this.pendingRefresh = this.performRefresh(refreshToken).finally(() => {
+      this.pendingRefresh = null;
+    });
+    return this.pendingRefresh;
+  }
+
+  private async performRefresh(refreshToken: string) {
+    let response: Response;
+    try {
+      const form = new URLSearchParams();
+      form.append('refreshToken', refreshToken);
+      response = await fetch(`${this.baseUrl}/auth/refreshToken`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: form.toString(),
+      });
+    } catch (error) {
+      // A network failure means unreachable, not revoked: keep the tokens and
+      // let the caller surface the failure. The next call retries.
+      console.error('Failed to refresh token:', error);
+      throw error;
+    }
+
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        this.endSession(refreshToken);
+        return;
+      }
+      throw new Error(`Refresh unavailable (${response.status})`);
+    }
+
+    const data = await response.json();
+    setTokens(data.token, data.refreshToken);
+  }
+
+  // endSession is what a revocation looks like from the client: the account was
+  // disabled, deleted, demoted, changed its password elsewhere, or a replay was
+  // detected. All of those now arrive mid-session, so clearing the tokens is
+  // not enough — nothing in the app re-reads them, and the tab would otherwise
+  // keep rendering a dashboard whose every request 401s. A full navigation is
+  // the only thing that drops the in-memory state along with the credential.
+  //
+  // spentToken guards a race between tabs: they share localStorage, so a tab
+  // whose refresh is rejected must not delete the pair a sibling has just
+  // stored (a password change, or its own successful rotation).
+  private endSession(spentToken: string) {
+    if (getRefreshToken() !== spentToken) {
+      return;
+    }
+    logout();
+    const basename = dashboardBasename();
+    const currentPath = window.location.pathname.startsWith(basename)
+      ? window.location.pathname.slice(basename.length)
+      : window.location.pathname;
+    if (currentPath && currentPath !== '/login') {
+      saveReturnTo(currentPath + window.location.search);
+    }
+    window.location.assign(`${basename}/login`);
+  }
+
+  public async login(email: string, password: string) {
+    const form = new URLSearchParams();
+    form.append('email', email);
+    form.append('password', password);
+    return this.request<{ token: string; refreshToken: string }>(`/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form.toString(),
+    });
+  }
+
+  // The OAuth consent screen echoes back the authorization request it was
+  // opened with, plus the user's decision; the server re-validates everything
+  // and answers with the redirect delivering the code (or the denial).
+  public async submitOAuthConsent(
+    authorizationParams: URLSearchParams,
+    decision: 'approve' | 'deny'
+  ) {
+    const form = new URLSearchParams();
+    for (const name of [
+      'client_id',
+      'redirect_uri',
+      'response_type',
+      'code_challenge',
+      'code_challenge_method',
+      'scope',
+      'state',
+      'resource',
+    ]) {
+      const value = authorizationParams.get(name);
+      if (value) {
+        form.append(name, value);
+      }
+    }
+    form.append('decision', decision);
+    return this.request<{ redirectUrl: string }>(`/api/oauth/consent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form.toString(),
+    });
+  }
+
+  public async getMe() {
+    return this.request<UserRecord>(`/api/me`, {
+      method: 'GET',
+    });
+  }
+
+  // The current account's permission map (enterprise user roles, ee/rbac).
+  // enabled=false means fine-grained roles are not enforced and the UI falls
+  // back to the community rule: isAdmin decides everything. apps is null for
+  // admins and when disabled.
+  public async getMyPermissions() {
+    return this.request<{
+      // Are fine-grained roles enforced right now (control plane + valid
+      // enterprise license). Unrelated to whether the ACCOUNT is enabled,
+      // which is settled at sign-in and never reaches this response.
+      rbacEnabled: boolean;
+      isAdmin: boolean;
+      apps: Record<string, string[]> | null;
+    }>(`/api/me/permissions`, {
+      method: 'GET',
+    });
+  }
+
+  // Changing the password revokes every session the account held, this one
+  // included, so the server hands back a replacement pair. A 204 means it
+  // could not, and the only way forward is signing in again.
+  public async changeMyPassword(payload: { currentPassword: string; newPassword: string }) {
+    const session = await this.request<{ token?: string; refreshToken?: string }>(
+      `/api/me/password`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }
+    );
+    if (session?.token && session?.refreshToken) {
+      setTokens(session.token, session.refreshToken);
+      return true;
+    }
+    logout();
+    return false;
+  }
+
+  public async getUsers() {
+    return this.request<UserRecord[]>(`/api/users`, {
+      method: 'GET',
+    });
+  }
+
+  public async createUser(payload: { email: string; password: string; isAdmin: boolean }) {
+    return this.request<UserRecord>(`/api/users`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  public async updateUserAdmin(userId: string, isAdmin: boolean) {
+    return this.request<void>(`/api/users/${encodeURIComponent(userId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ isAdmin }),
+    });
+  }
+
+  public async updateUserEnabled(userId: string, enabled: boolean) {
+    return this.request<void>(`/api/users/${encodeURIComponent(userId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+  }
+
+  public async deleteUser(userId: string) {
+    return this.request<void>(`/api/users/${encodeURIComponent(userId)}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Enterprise audit log (admin only; reads work without a license so the
+  // page can show its dormant state behind the enterprise gate).
+  public async getAuditEvents(params: AuditEventsQuery = {}) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== null && value !== '') {
+        query.set(key, String(value));
+      }
+    }
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return this.request<AuditEventsPage>(`/api/audit/events${suffix}`, {
+      method: 'GET',
+    });
+  }
+
+  // Enterprise user roles (admin only; writes are license-gated server-side).
+  public async getRoles() {
+    return this.request<RoleRecord[]>(`/api/roles`, {
+      method: 'GET',
+    });
+  }
+
+  public async createRole(payload: { name: string; permissions: string[] }) {
+    return this.request<RoleRecord>(`/api/roles`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  public async updateRole(roleId: string, payload: { name: string; permissions: string[] }) {
+    return this.request<void>(`/api/roles/${encodeURIComponent(roleId)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  public async deleteRole(roleId: string) {
+    return this.request<void>(`/api/roles/${encodeURIComponent(roleId)}`, {
+      method: 'DELETE',
+    });
+  }
+
+  public async getUserGrants(userId: string) {
+    return this.request<GrantRecord[]>(`/api/users/${encodeURIComponent(userId)}/grants`, {
+      method: 'GET',
+    });
+  }
+
+  // Per-user grant counts ({userId: count}); users absent from the map hold
+  // no grants. Backs the "no app access" warning on the Users page.
+  public async getUserGrantsSummary() {
+    return this.request<Record<string, number>>(`/api/users/grants/summary`, {
+      method: 'GET',
+    });
+  }
+
+  // Replaces the member's whole grant set in one transaction server-side.
+  public async setUserGrants(
+    userId: string,
+    grants: { appId: string; roleId: string | null; extraPermissions: string[] }[]
+  ) {
+    return this.request<void>(`/api/users/${encodeURIComponent(userId)}/grants`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(grants),
+    });
+  }
+
+  public async getLicense() {
+    return this.request<LicenseStatus>(`/api/license`, {
+      method: 'GET',
+    });
+  }
+
+  // Pre-auth: answers whether the SSO button should show on the login page.
+  public async getSsoPublicConfig() {
+    return this.request<SsoPublicConfig>(`/auth/sso/config`, {
+      method: 'GET',
+    });
+  }
+
+  // Entry point of the SSO flow: a plain navigation, not an XHR — the server
+  // answers with a redirect to the identity provider.
+  public ssoLoginUrl(): string {
+    return `${this.baseUrl}/auth/sso/login`;
+  }
+
+  // The callback the IdP must allow. Derived the same way the server derives
+  // it from BASE_URL; the server's value (SsoSettings.redirectUri) stays the
+  // source of truth once a configuration exists.
+  public ssoRedirectUri(): string {
+    return `${this.baseUrl}/auth/sso/callback`;
+  }
+
+  // Admin SSO configuration. `null` means "not configured yet": the card
+  // shows the empty form instead of an error.
+  public async getSsoSettings(): Promise<SsoSettings | null> {
+    try {
+      return await this.request<SsoSettings>(`/api/sso`, { method: 'GET' });
+    } catch (error) {
+      if (error instanceof ApiProblemError && error.status === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  public async saveSsoSettings(payload: SaveSsoSettingsPayload) {
+    return this.request<SsoSettings>(`/api/sso`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  public async deleteSsoSettings() {
+    return this.request<void>(`/api/sso`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Asks the license server whether the key is usable, without consuming it.
+  public async checkLicense(key: string) {
+    return this.request<LicenseCheckResult>(`/api/license/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    });
+  }
+
+  public async activateLicense(key: string) {
+    return this.request<LicenseStatus>(`/api/license`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    });
+  }
+
+  public async removeLicense() {
+    return this.request<void>(`/api/license`, {
+      method: 'DELETE',
+    });
+  }
+
+  public async createApp(payload: CreateAppPayload) {
+    return this.request<{ appId: string }>(`/api/apps`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  // The Expo token rides in a header, never in a URL where proxies and access logs keep it.
+  public async listExpoImportApps(accessToken: string) {
+    return this.request<ExpoAccountApps[]>(`/api/expo-import/apps`, {
+      method: 'GET',
+      headers: { 'X-Expo-Access-Token': accessToken },
+    });
+  }
+
+  public async previewExpoImport(accessToken: string, expoAppId: string) {
+    return this.request<ExpoImportPlan>(
+      `/api/expo-import/preview?expoAppId=${encodeURIComponent(expoAppId)}`,
+      { method: 'GET', headers: { 'X-Expo-Access-Token': accessToken } }
+    );
+  }
+
+  public async importExpoApp(accessToken: string, payload: ExpoImportPayload) {
+    return this.request<ExpoImportResult>(`/api/expo-import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Expo-Access-Token': accessToken },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  public async getExpoImportJob(jobId: string) {
+    return this.request<ExpoHistoryJobStatus>(
+      `/api/expo-import/jobs/${encodeURIComponent(jobId)}`,
+      { method: 'GET' }
+    );
+  }
+
+  public async getExpoImportJobForApp(appId: string) {
+    return this.request<{ jobId: string | null; status: ExpoHistoryJobStatus | null }>(
+      `/api/expo-import/apps/${encodeURIComponent(appId)}/job`,
+      { method: 'GET' }
+    );
+  }
+
+  public async cancelExpoImportJob(jobId: string) {
+    return this.request<void>(`/api/expo-import/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: 'POST',
+    });
+  }
+
+  public async getApps() {
+    return this.request<AppDescriptor[]>(`/api/apps`, {
+      method: 'GET',
+    });
+  }
+
+  public async getApp(appId: string) {
+    return this.request<AppDetails>(`/api/apps/${encodeURIComponent(appId)}`, {
+      method: 'GET',
+    });
+  }
+
+  public async deleteApp() {
+    return this.request<void>(`${this.appScope()}`, {
+      method: 'DELETE',
+    });
+  }
+
+  public async updateAppName(name: string) {
+    return this.request<void>(`${this.appScope()}/name`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+  }
+
+  public async updateAppGitUrl(gitUrl: string) {
+    return this.request<void>(`${this.appScope()}/git-url`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gitUrl }),
+    });
+  }
+
+  public async getApiKeys() {
+    return this.request<ApiKeyRecord[]>(`${this.appScope()}/apiKeys`, {
+      method: 'GET',
+    });
+  }
+
+  // Same list with an explicit app, for cross-app surfaces (the audit log's
+  // actor filter) that are not bound to the selected app.
+  public async getApiKeysForApp(appId: string) {
+    return this.request<ApiKeyRecord[]>(`/api/apps/${encodeURIComponent(appId)}/apiKeys`, {
+      method: 'GET',
+    });
+  }
+
+  public async createApiKey(name: string) {
+    return this.request<CreateApiKeyResponse>(`${this.appScope()}/apiKeys`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+  }
+
+  public async revokeApiKey(apiKeyId: string) {
+    return this.request<void>(`${this.appScope()}/apiKeys/${encodeURIComponent(apiKeyId)}/revoke`, {
+      method: 'DELETE',
+    });
+  }
+
+  public async setBranchProtection(branchName: string, isProtected: boolean) {
+    return this.request<void>(
+      `${this.appScope()}/branches/${encodeURIComponent(branchName)}/protection`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ protected: isProtected }),
+      }
+    );
+  }
+
+  public async getApiKeyAccess() {
+    return this.request<ApiKeyAccessRecord[]>(`${this.appScope()}/apiKeys/access`, {
+      method: 'GET',
+    });
+  }
+
+  // The whole access of a token is replaced at once, so every field has to be
+  // sent every time: an omitted branchRules would not mean "leave them alone",
+  // it would clear the list, which the server reads as "every branch".
+  public async setApiKeyAccess(
+    apiKeyId: string,
+    access: {
+      branchRules: BranchRuleRecord[];
+      allowedIps: string[];
+    }
+  ) {
+    return this.request<void>(`${this.appScope()}/apiKeys/${encodeURIComponent(apiKeyId)}/access`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(access),
+    });
+  }
+
+  // The one route that answers something other than JSON.
+  public async downloadAppCertificate(appId: string): Promise<string> {
+    return this.request<string>(
+      `/api/apps/${encodeURIComponent(appId)}/certificate`,
+      { method: 'GET' },
+      'text'
+    );
+  }
+
+  public async getChannels() {
+    return this.request<ChannelRecord[]>(`${this.appScope()}/channels`, {
+      method: 'GET',
+    });
+  }
+
+  public async createChannel(payload: { branchName?: string; channelName: string }) {
+    return this.request<{ channelId: string }>(`${this.appScope()}/channels`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  public async deleteChannel(channelName: string) {
+    return this.request<void>(`${this.appScope()}/channels/${encodeURIComponent(channelName)}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // A full replacement: the pattern is always sent, never inferred, so turning
+  // the switch on cannot silently widen a channel that named a narrower one.
+  public async setChannelBranchSurfing(channelName: string, payload: BranchSurfingRecord) {
+    return this.request<void>(
+      `${this.appScope()}/channels/${encodeURIComponent(channelName)}/branch-surfing`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  public async getBranches() {
+    return this.request<BranchRecord[]>(`${this.appScope()}/branches`, {
+      method: 'GET',
+    });
+  }
+
+  public async createBranch(branchName: string) {
+    return this.request<{ branchId: string }>(`${this.appScope()}/branches`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ branchName }),
+    });
+  }
+
+  public async deleteBranch(branchName: string) {
+    return this.request<void>(`${this.appScope()}/branches/${encodeURIComponent(branchName)}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Remaps a release channel onto a branch. The channel id drives the remap;
+  // its name is also sent because the server invalidates the channel-mapping
+  // cache by name.
+  public async updateChannelBranchMapping(
+    branchId: string,
+    payload: {
+      releaseChannelId: string;
+      releaseChannelName: string;
+    }
+  ) {
+    return this.request(
+      `${this.appScope()}/branch/${encodeURIComponent(branchId)}/updateChannelBranchMapping`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  public async getRuntimeVersions(branch: string) {
+    return this.request<RuntimeVersionRecord[]>(
+      `${this.appScope()}/branch/${encodeURIComponent(branch)}/runtimeVersions`,
+      {
+        method: 'GET',
+      }
+    );
+  }
+  public async getUpdates(branch: string, runtimeVersion: string, cursor?: string, limit = 20) {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (cursor) query.set('cursor', cursor);
+    return this.request<UpdatesPage>(
+      `${this.appScope()}/branch/${encodeURIComponent(branch)}/runtimeVersion/${encodeURIComponent(runtimeVersion)}/updates?${query.toString()}`,
+      {
+        method: 'GET',
+      }
+    );
+  }
+  public async getUpdateFeed(query: UpdateFeedQuery = {}) {
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== '') search.set(key, String(value));
+    }
+    // Not URLSearchParams.size: it needs Safari 17+/Chrome 113+, above our
+    // build target, and on older browsers `undefined > 0` silently drops
+    // every param (filters AND the pagination cursor).
+    const queryString = search.toString();
+    const suffix = queryString ? `?${queryString}` : '';
+    return this.request<UpdateFeedPage>(`${this.appScope()}/updates${suffix}`, {
+      method: 'GET',
+    });
+  }
+  // Sends a branch and runtime version back to the bundle embedded in the app.
+  // Omitting `platform` rolls back both, the same as running the CLI's rollback
+  // command once per platform. The message is required: it is what the update
+  // row shows afterwards.
+  public async createRollback(
+    branch: string,
+    runtimeVersion: string,
+    payload: { message: string; platform?: string }
+  ) {
+    return this.request<PublishResult>(
+      `${this.appScope()}/branch/${encodeURIComponent(branch)}/runtimeVersion/${encodeURIComponent(runtimeVersion)}/rollback`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  // Puts a past update back at the head of its branch. Pass `updateId` for a
+  // single update (both storage modes) or `publishGroup` to republish every
+  // per-platform member of one publish group at once (control plane only).
+  public async republishUpdate(
+    branch: string,
+    runtimeVersion: string,
+    payload: { updateId: string } | { publishGroup: string }
+  ) {
+    return this.request<PublishResult>(
+      `${this.appScope()}/branch/${encodeURIComponent(branch)}/runtimeVersion/${encodeURIComponent(runtimeVersion)}/republish`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  public async getUpdateHealth(updateUUIDs: string[]) {
+    return this.request<{ updates: Record<string, UpdateHealthRecord> }>(
+      `${this.appScope()}/identity/update-health?ids=${encodeURIComponent(updateUUIDs.join(','))}`,
+      {
+        method: 'GET',
+      }
+    );
+  }
+  // Its own route, not a mode of getUpdateHealthHistory below. Splitting the
+  // window by a device dimension reads different data and needs observe:read,
+  // while the plain series is open to anyone who can see the app because the
+  // updates table and the rollout card both draw it.
+  public async getUpdateHealthSegments(
+    updateUUIDs: string[],
+    dimension: string,
+    from?: string,
+    to?: string
+  ) {
+    const search = new URLSearchParams({ ids: updateUUIDs.join(','), dimension });
+    if (from) search.set('from', from);
+    if (to) search.set('to', to);
+    return this.request<UpdateHealthSegmentsResponse>(
+      `${this.appScope()}/observe/update-health/segments?${search.toString()}`,
+      { method: 'GET' }
+    );
+  }
+  public async getUpdateHealthHistory(updateUUIDs: string[], from?: string, to?: string) {
+    const search = new URLSearchParams({ ids: updateUUIDs.join(',') });
+    if (from) search.set('from', from);
+    if (to) search.set('to', to);
+    return this.request<UpdateHealthHistoryResponse>(
+      `${this.appScope()}/observe/update-health/history?${search.toString()}`,
+      {
+        method: 'GET',
+      }
+    );
+  }
+  public async getIdentitySchema() {
+    return this.request<{ keys: IdentitySchemaKey[] }>(`${this.appScope()}/identity/schema`, {
+      method: 'GET',
+    });
+  }
+  public async saveIdentitySchemaKey(key: string, spec: Omit<IdentitySchemaKey, 'key'>) {
+    return this.request<IdentitySchemaKey>(
+      `${this.appScope()}/identity/schema/${encodeURIComponent(key)}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(spec),
+      }
+    );
+  }
+  public async deleteIdentitySchemaKey(key: string) {
+    return this.request<void>(`${this.appScope()}/identity/schema/${encodeURIComponent(key)}`, {
+      method: 'DELETE',
+    });
+  }
+  public async searchIdentityValues(key: string, search = '') {
+    const query = new URLSearchParams({ key, search, limit: '50' });
+    return this.request<{ values: IdentityValueSuggestion[] }>(
+      `${this.appScope()}/identity/values?${query.toString()}`,
+      { method: 'GET' }
+    );
+  }
+  public async getObserveOverview(query: ObserveQuery = {}) {
+    const search = observeSearchParams(query);
+    return this.request<ObserveOverview>(
+      `${this.appScope()}/observe/overview?${search.toString()}`,
+      { method: 'GET' }
+    );
+  }
+  // The live feed behind the map. `since` is the cursor the server handed back
+  // last time, never a locally computed timestamp: the browser clock has no
+  // say in where the window starts.
+  public async getObserveCheckIns(since: string | undefined, query: ObserveQuery = {}) {
+    const search = observeSearchParams(query);
+    if (since) search.set('since', since);
+    return this.request<ObserveCheckInFeed>(
+      `${this.appScope()}/observe/check-ins?${search.toString()}`,
+      { method: 'GET' }
+    );
+  }
+  public async getObserveEvents(query: ObserveQuery = {}) {
+    const search = observeSearchParams(query);
+    return this.request<ObserveEvents>(`${this.appScope()}/observe/events?${search.toString()}`, {
+      method: 'GET',
+    });
+  }
+  public async getObserveLogs(query: ObserveLogsQuery = {}) {
+    const search = observeSearchParams(query);
+    return this.request<ObserveLogsPage>(`${this.appScope()}/observe/logs?${search.toString()}`, {
+      method: 'GET',
+    });
+  }
+  public async getIdentityDevices(query: IdentityDeviceQuery = {}, cursor?: string, limit = 50) {
+    const search = observeSearchParams(query);
+    if (cursor) search.set('cursor', cursor);
+    search.set('limit', String(limit));
+    return this.request<IdentityDevicePage>(
+      `${this.appScope()}/identity/devices?${search.toString()}`,
+      { method: 'GET' }
+    );
+  }
+  // Takes the same filters as the inventory above, and no window: the registry
+  // answers on its own presence window, which is what "online" means here.
+  public async getOnlineDevices(query: IdentityDeviceQuery = {}, minutes?: number) {
+    const search = observeSearchParams(query);
+    if (minutes) search.set('minutes', String(minutes));
+    return this.request<{ online: number; windowMinutes: number }>(
+      `${this.appScope()}/identity/online?${search.toString()}`,
+      { method: 'GET' }
+    );
+  }
+  // The conditions a timing can be filtered on, and the values each takes. The
+  // ranges are cut server-side, so they are read from there rather than
+  // restated: a bucket renamed in Go would otherwise leave the picker offering
+  // a range no query can match.
+  public async getObserveConditions() {
+    return this.request<ObserveConditionDefinition[]>(`${this.appScope()}/observe/conditions`, {
+      method: 'GET',
+    });
+  }
+
+  public async getObserveBreakdown(
+    metric: string,
+    dimension: ObserveBreakdownDimension,
+    query: ObserveQuery = {},
+    options: { limit?: number; points?: boolean } = {}
+  ) {
+    const search = observeSearchParams(query);
+    search.set('metric', metric);
+    search.set('dimension', dimension);
+    if (options.limit) search.set('limit', String(options.limit));
+    if (options.points) search.set('points', '1');
+    return this.request<ObserveBreakdown>(
+      `${this.appScope()}/observe/breakdown?${search.toString()}`,
+      { method: 'GET' }
+    );
+  }
+  public async getUpdateDetails(branch: string, runtimeVersion: string, updateId: string) {
+    return this.request<UpdateDetailsRecord>(
+      `${this.appScope()}/branch/${encodeURIComponent(branch)}/runtimeVersion/${encodeURIComponent(runtimeVersion)}/updates/${encodeURIComponent(updateId)}`,
+      {
+        method: 'GET',
+      }
+    );
+  }
+
+  public async getUpdatePatches(branch: string, runtimeVersion: string, updateId: string) {
+    return this.request<BundlePatchRecord[]>(
+      `${this.appScope()}/branch/${encodeURIComponent(branch)}/runtimeVersion/${encodeURIComponent(runtimeVersion)}/updates/${encodeURIComponent(updateId)}/patches`,
+      { method: 'GET' }
+    );
+  }
+  // Plans the patches toward this update again, as its publish did, and says
+  // how many it scheduled: zero when no earlier update of the platform exists.
+  public async recomputeUpdatePatches(branch: string, runtimeVersion: string, updateId: string) {
+    return this.request<{ scheduled: number }>(
+      `${this.appScope()}/branch/${encodeURIComponent(branch)}/runtimeVersion/${encodeURIComponent(runtimeVersion)}/updates/${encodeURIComponent(updateId)}/patches/recompute`,
+      { method: 'POST' }
+    );
+  }
+
+  // Progressive rollout, control-plane only. Channel rollouts are keyed by
+  // channel name (like the sibling channel routes); per-update rollouts by
+  // branch + runtime version. Mutations are admin-only server-side.
+  public async startChannelRollout(
+    channelName: string,
+    payload: { branchName: string; percentage: number }
+  ) {
+    return this.request<ChannelRolloutRecord>(
+      `${this.appScope()}/channels/${encodeURIComponent(channelName)}/rollout`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  public async updateChannelRollout(channelName: string, payload: { percentage: number }) {
+    return this.request<ChannelRolloutRecord>(
+      `${this.appScope()}/channels/${encodeURIComponent(channelName)}/rollout`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  // outcome: 'promote' repoints the channel onto the rollout branch; 'revert'
+  // discards the rollout and keeps the default branch.
+  public async endChannelRollout(channelName: string, outcome: 'promote' | 'revert') {
+    return this.request<void>(
+      `${this.appScope()}/channels/${encodeURIComponent(channelName)}/rollout/end`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ outcome }),
+      }
+    );
+  }
+
+  public async getUpdateRollout(branch: string, runtimeVersion: string) {
+    return this.request<{ active: boolean; updates: UpdateRolloutInfo[] }>(
+      `${this.appScope()}/branch/${encodeURIComponent(branch)}/runtimeVersion/${encodeURIComponent(runtimeVersion)}/rollout`,
+      {
+        method: 'GET',
+      }
+    );
+  }
+
+  // Sets the rollout percentage. Server accepts monotonic increases only;
+  // percentage 100 finishes the rollout. `expectedUpdateId` guards against a
+  // stale tab acting on a rollout that has since changed (409).
+  public async setUpdateRolloutPercentage(
+    branch: string,
+    runtimeVersion: string,
+    payload: { percentage: number; expectedUpdateId?: string }
+  ) {
+    return this.request<void>(
+      `${this.appScope()}/branch/${encodeURIComponent(branch)}/runtimeVersion/${encodeURIComponent(runtimeVersion)}/rollout`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  public async revertUpdateRollout(
+    branch: string,
+    runtimeVersion: string,
+    payload: { expectedUpdateId?: string } = {}
+  ) {
+    return this.request<void>(
+      `${this.appScope()}/branch/${encodeURIComponent(branch)}/runtimeVersion/${encodeURIComponent(runtimeVersion)}/rollout/revert`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  public async getSettings() {
+    return this.request<ServerSettings>(`/api/settings`, {
+      method: 'GET',
+    });
+  }
+}
+
+export const api = new ApiClient();

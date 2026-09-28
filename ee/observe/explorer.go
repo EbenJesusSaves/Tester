@@ -1,0 +1,701 @@
+// Copyright (c) 2026 Axel Marciano (Mercure Technologies). All rights reserved.
+// This file is governed by the Mercure Technologies Enterprise Edition License
+// (see ee/LICENSE); it is NOT covered by the MIT license of this repository.
+
+package observe
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	chdriver "github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/ext"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"xprem/internal/database"
+	"xprem/internal/database/clickhouse"
+	"xprem/internal/database/postgres/pgdb"
+	"xprem/internal/repository"
+)
+
+const embeddedUpdateID = "00000000-0000-0000-0000-000000000000"
+
+var observedMetricDefinitions = []MetricDefinition{
+	{
+		ID: "cold-launch", Name: "expo.app_startup.cold_launch_time", Label: "Cold launch", Unit: "s",
+		Description: "Process start to the first frame of the root view, when the app was not already running. Prewarmed launches are not measured on iOS.",
+		Category:    "startup", MinimumSDK: 55,
+	},
+	{
+		ID: "warm-launch", Name: "expo.app_startup.warm_launch_time", Label: "Warm launch", Unit: "s",
+		Description: "The same measurement when the process was still alive and only the interface had to come back, so it skips everything a cold start pays for.",
+		Category:    "startup", MinimumSDK: 55,
+	},
+	{
+		ID: "bundle-load", Name: "expo.app_startup.bundle_load_time", Label: "Bundle load", Unit: "s",
+		Description: "How long evaluating the JavaScript bundle took. It happens inside a cold launch rather than after it, so it is a share of that number, not an extra wait.",
+		Category:    "startup", MinimumSDK: 55,
+	},
+	{
+		ID: "first-render", Name: "expo.app_startup.ttr", Label: "Time to first render", Unit: "s",
+		Description: "Launch to the first frame your root component paints. Marked automatically when ObserveRoot mounts.",
+		Category:    "startup", MinimumSDK: 55,
+	},
+	{
+		ID: "navigation-cold", Name: "expo.navigation.cold_ttr", Label: "Cold navigation", Unit: "s",
+		Description: "Opening a screen for the first time in a session, until it renders.",
+		Category:    "navigation", MinimumSDK: 56,
+	},
+	{
+		ID: "navigation-warm", Name: "expo.navigation.warm_ttr", Label: "Warm navigation", Unit: "s",
+		Description: "Coming back to a screen already visited in that session, which skips the work the first visit paid for.",
+		Category:    "navigation", MinimumSDK: 56,
+	},
+	{
+		ID: "interactive", Name: "expo.app_startup.tti", Label: "Time to interactive", Unit: "s",
+		Description: "Launch to the moment the app can actually be used, marked by your own call to markInteractive(). The one timing that carries the state the device was in.",
+		Category:    "startup", MinimumSDK: 55,
+	},
+	{
+		ID: "navigation-interactive", Name: "expo.navigation.tti", Label: "Navigation interactive", Unit: "s",
+		Description: "A screen from opening to usable. Needs a router integration enabled in configure().",
+		Category:    "navigation", MinimumSDK: 56,
+	},
+	{
+		ID: "update-download", Name: "expo.updates.download_time", Label: "Update download", Unit: "s",
+		Description: "How long fetching an update took, measured when expo-updates finishes downloading it. Only the devices that received one report it, so the count is smaller than the fleet.",
+		Category:    "updates", MinimumSDK: 55,
+	},
+	{
+		ID: "legacy-load", Name: "expo.app_startup.load_time", Label: "App load (legacy)", Unit: "s",
+		Description: "Reported by older iOS clients only, kept so a fleet still running them is not silently missing from this page.",
+		Category:    "startup", MinimumSDK: 55,
+	},
+	{
+		ID: "legacy-launch", Name: "expo.app_startup.launch_time", Label: "App launch (legacy)", Unit: "s",
+		Description: "Reported by older iOS clients only, kept so a fleet still running them is not silently missing from this page.",
+		Category:    "startup", MinimumSDK: 55,
+	},
+}
+
+type ExplorerQuery struct {
+	From time.Time
+	To   time.Time
+	// Every dimension is a set: empty means "do not filter".
+	Platform  []string
+	UpdateIDs []string
+	// UpdateGroupIDs are the groups asked for; MemberUpdateIDs are what they resolve to.
+	UpdateGroupIDs  []string
+	MemberUpdateIDs []string
+	Branches        []string
+	RuntimeVersions []string
+	Channels        []string
+	EASClientIDs    []string
+	AppVersions     []string
+	AppBuildNumbers []string
+	EASBuildIDs     []string
+	Environments    []string
+	OSNames         []string
+	OSVersions      []string
+	DeviceModels    []string
+	// CountryCode is frozen at ingestion, not the device's current country.
+	CountryCodes   []string
+	MetadataFilter [][]byte
+	// Conditions narrows on the device's reported state; only timing reads honor them.
+	Conditions map[string][]string
+	Bucket     time.Duration
+}
+type MetricDefinition struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Label string `json:"label"`
+	// Description is what the timing actually measures, shown next to the chart.
+	Description string `json:"description"`
+	Unit        string `json:"unit"`
+	Category    string `json:"category"`
+	MinimumSDK  int    `json:"minimumSdk"`
+}
+
+type ObserveMetricPoint struct {
+	Timestamp time.Time `json:"timestamp"`
+	Value     float64   `json:"value"`
+}
+
+type MetricStats struct {
+	Count  uint64  `json:"count"`
+	Median float64 `json:"median"`
+	Avg    float64 `json:"avg"`
+	Min    float64 `json:"min"`
+	Max    float64 `json:"max"`
+	P90    float64 `json:"p90"`
+	P99    float64 `json:"p99"`
+	// Devices is the count of distinct installs behind the samples.
+	Devices uint64 `json:"devices"`
+	// ReportsConditions is whether any sample carried the device's state.
+	ReportsConditions bool `json:"reportsConditions"`
+}
+
+type MetricSeries struct {
+	MetricDefinition
+	Stats  MetricStats          `json:"stats"`
+	Points []ObserveMetricPoint `json:"points"`
+}
+
+type ObserveSummary struct {
+	Users     uint64   `json:"users"`
+	Releases  uint64   `json:"releases"`
+	Builds    uint64   `json:"builds"`
+	Updates   uint64   `json:"updates"`
+	Sessions  uint64   `json:"sessions"`
+	Events    uint64   `json:"events"`
+	Platforms []string `json:"platforms"`
+}
+type Overview struct {
+	Available bool              `json:"available"`
+	Summary   ObserveSummary    `json:"summary"`
+	Metrics   []MetricSeries    `json:"metrics"`
+	Locations []ObserveLocation `json:"locations"`
+}
+
+// observeCohortLimit caps the identity cohort an attribute filter resolves to.
+const observeCohortLimit = 200_000
+
+type ObserveEventPoint struct {
+	Timestamp time.Time `json:"timestamp"`
+	Count     uint64    `json:"count"`
+}
+
+type ObserveEventSeries struct {
+	Name     string              `json:"name"`
+	Count    uint64              `json:"count"`
+	Users    uint64              `json:"users"`
+	Sessions uint64              `json:"sessions"`
+	Points   []ObserveEventPoint `json:"points"`
+}
+
+type Events struct {
+	Available bool                 `json:"available"`
+	Events    []ObserveEventSeries `json:"events"`
+}
+
+// Explorer queries telemetry facts from ClickHouse and the mutable geo /
+// identity dimension from PostgreSQL. ClickHouse may be nil.
+type Explorer struct {
+	postgres   *database.Engine
+	clickhouse *clickhouse.Engine
+}
+
+func NewExplorer(postgres *database.Engine, clickhouse *clickhouse.Engine) *Explorer {
+	if postgres == nil {
+		return nil
+	}
+	return &Explorer{postgres: postgres, clickhouse: clickhouse}
+}
+
+func (e *Explorer) cohortContext(ctx context.Context, appID string, activeSince time.Time, filters [][]byte) (context.Context, bool, error) {
+	if len(filters) == 0 {
+		return ctx, false, nil
+	}
+	appUUID, err := repository.ParsePgUUID(appID)
+	if err != nil {
+		return ctx, false, err
+	}
+	ids, err := e.postgres.ListObserveCohortDeviceIDs(ctx, pgdb.ListObserveCohortDeviceIDsParams{
+		AppID:       appUUID,
+		ActiveSince: pgtype.Timestamptz{Time: activeSince.UTC(), Valid: true},
+		Filters:     filters,
+		// One over the cap, so "at the cap" is not mistaken for "truncated".
+		Lim: observeCohortLimit + 1,
+	})
+	if err != nil {
+		return ctx, false, fmt.Errorf("listing observe cohort: %w", err)
+	}
+	if len(ids) > observeCohortLimit {
+		return ctx, false, errObserveCohortTooLarge
+	}
+	table, err := ext.NewTable("observe_identity_cohort", ext.Column("eas_client_id", "UUID"))
+	if err != nil {
+		return ctx, false, fmt.Errorf("creating observe cohort: %w", err)
+	}
+	for _, id := range ids {
+		if err := table.Append(uuid.UUID(id.Bytes)); err != nil {
+			return ctx, false, fmt.Errorf("building observe cohort: %w", err)
+		}
+	}
+	return chdriver.Context(ctx, chdriver.WithExternalTable(table)), len(ids) == 0, nil
+}
+
+// prepareTelemetryRead resolves update groups to concrete update ids and
+// installs the identity cohort behind an attribute filter as an external
+// table. The returned bool says the filters cannot match a single row.
+// telemetryReadTimeout bounds a ClickHouse read.
+const telemetryReadTimeout = 30 * time.Second
+
+func (e *Explorer) prepareTelemetryRead(
+	ctx context.Context,
+	appID string,
+	query ExplorerQuery,
+) (context.Context, ExplorerQuery, bool, error) {
+	resolved, emptyUpdateGroup, err := e.resolveUpdateGroup(ctx, appID, query)
+	if err != nil {
+		return ctx, query, false, err
+	}
+	if emptyUpdateGroup {
+		return ctx, resolved, true, nil
+	}
+	queryContext, emptyCohort, err := e.cohortContext(ctx, appID, resolved.From, resolved.MetadataFilter)
+	if err != nil {
+		return ctx, resolved, false, err
+	}
+	return queryContext, resolved, emptyCohort, nil
+}
+
+// resolveUpdateGroup collects the update ids behind the requested groups.
+func (e *Explorer) resolveUpdateGroup(ctx context.Context, appID string, query ExplorerQuery) (ExplorerQuery, bool, error) {
+	if len(query.UpdateGroupIDs) == 0 {
+		return query, false, nil
+	}
+	appUUID, err := repository.ParsePgUUID(appID)
+	if err != nil {
+		return query, false, err
+	}
+	members := make([]string, 0, 2*len(query.UpdateGroupIDs))
+	for _, group := range query.UpdateGroupIDs {
+		groupUUID, err := repository.ParsePgUUID(group)
+		if err != nil {
+			return query, false, err
+		}
+		ids, err := e.postgres.ListObserveUpdateUUIDsByPublishGroup(
+			ctx,
+			pgdb.ListObserveUpdateUUIDsByPublishGroupParams{
+				AppID:        appUUID,
+				PublishGroup: groupUUID,
+			},
+		)
+		if err != nil {
+			return query, false, fmt.Errorf("resolving Observe update group: %w", err)
+		}
+		for _, id := range ids {
+			members = append(members, uuid.UUID(id.Bytes).String())
+		}
+	}
+	query.MemberUpdateIDs = members
+	return query, len(members) == 0, nil
+}
+
+func telemetryWhere(table sqlFragment, query ExplorerQuery, cohort bool) (sqlFragment, []any) {
+	// app_id is prepended by callers so unions can reuse this helper cleanly.
+	where := table + ".app_id = ? AND " + table + ".timestamp >= ? AND " + table + ".timestamp <= ?"
+	args := []any{query.From.UTC(), query.To.UTC()}
+	inFilter := func(column sqlFragment, values []string) {
+		if len(values) == 0 {
+			return
+		}
+		where += " AND " + table + "." + column + " IN ?"
+		args = append(args, values)
+	}
+	inFilter("platform", query.Platform)
+	inFilter("update_id", query.UpdateIDs)
+	if len(query.UpdateGroupIDs) > 0 {
+		// Rows ingested before update_group_id existed carry the zero uuid, so
+		// the member ids stay in the predicate.
+		where += " AND (" + table + ".update_group_id IN ? OR " + table + ".update_id IN ?)"
+		args = append(args, query.UpdateGroupIDs, query.MemberUpdateIDs)
+	}
+	inFilter("branch", query.Branches)
+	inFilter("runtime_version", query.RuntimeVersions)
+	inFilter("channel", query.Channels)
+	inFilter("eas_client_id", query.EASClientIDs)
+	inFilter("app_version", query.AppVersions)
+	inFilter("app_build_number", query.AppBuildNumbers)
+	inFilter("eas_build_id", query.EASBuildIDs)
+	inFilter("environment", query.Environments)
+	inFilter("os_name", query.OSNames)
+	inFilter("os_version", query.OSVersions)
+	inFilter("device_model", query.DeviceModels)
+	inFilter("country_code", query.CountryCodes)
+	if cohort {
+		where += " AND " + table + ".eas_client_id IN (SELECT eas_client_id FROM observe_identity_cohort)"
+	}
+	return where, args
+}
+
+func prependAppID(appID string, args []any) []any {
+	return append([]any{appID}, args...)
+}
+
+func emptyMetricSeries() []MetricSeries {
+	metrics := make([]MetricSeries, 0, len(observedMetricDefinitions))
+	for _, definition := range observedMetricDefinitions {
+		metrics = append(metrics, MetricSeries{
+			MetricDefinition: definition,
+			Points:           []ObserveMetricPoint{},
+		})
+	}
+	return metrics
+}
+
+func (e *Explorer) ReadOverview(ctx context.Context, appID string, query ExplorerQuery) (Overview, error) {
+	return cachedRead(
+		ctx,
+		readCacheKey("overview", appID, query),
+		func(ctx context.Context) (Overview, error) { return e.readOverview(ctx, appID, query) })
+}
+
+func (e *Explorer) readOverview(ctx context.Context, appID string, query ExplorerQuery) (Overview, error) {
+	resolvedQuery, emptyUpdateGroup, err := e.resolveUpdateGroup(ctx, appID, query)
+	if err != nil {
+		return Overview{}, err
+	}
+	query = resolvedQuery
+	if emptyUpdateGroup {
+		return Overview{
+			Available: e.clickhouse != nil,
+			Metrics:   []MetricSeries{},
+			Locations: []ObserveLocation{},
+		}, nil
+	}
+	locations, err := e.cachedLocations(ctx, appID, query.From, query)
+	if err != nil {
+		return Overview{}, err
+	}
+	activeUsers, err := e.activeUsers(ctx, appID, query)
+	if err != nil {
+		return Overview{}, err
+	}
+	overview := Overview{
+		Available: e.clickhouse != nil,
+		Summary:   ObserveSummary{Users: activeUsers},
+		Metrics:   []MetricSeries{},
+		Locations: locations,
+	}
+	if e.clickhouse == nil {
+		return overview, nil
+	}
+
+	queryContext, emptyCohort, err := e.cohortContext(ctx, appID, query.From, query.MetadataFilter)
+	if err != nil {
+		return Overview{}, err
+	}
+	if emptyCohort {
+		return overview, nil
+	}
+	cohort := len(query.MetadataFilter) > 0
+	if err := e.readSummary(queryContext, appID, query, cohort, &overview.Summary); err != nil {
+		return Overview{}, err
+	}
+	// Deliberately sequential: each query already fans out across every core
+	// ClickHouse has, so concurrency here would only share the same cores.
+	metrics, err := e.readMetricStats(queryContext, appID, query, cohort)
+	if err != nil {
+		return Overview{}, err
+	}
+	// Only the series that will be read: readMetricStats keeps the hundred
+	// busiest names.
+	names := make([]string, 0, len(metrics))
+	for _, metric := range metrics {
+		names = append(names, metric.Name)
+	}
+	points, err := e.readMetricPoints(queryContext, appID, query, cohort, names)
+	if err != nil {
+		return Overview{}, err
+	}
+	overview.Metrics = metrics
+	for index := range overview.Metrics {
+		overview.Metrics[index].Points = points[overview.Metrics[index].Name]
+	}
+	return overview, nil
+}
+
+// readSummary aggregates devices, sessions and events across both telemetry
+// tables. Conditions are not applied here since they qualify one measurement,
+// not the fleet.
+func (e *Explorer) readSummary(ctx context.Context, appID string, query ExplorerQuery, cohort bool, summary *ObserveSummary) error {
+	metricsWhere, metricsArgs := telemetryWhere("m", query, cohort)
+	logsWhere, logsArgs := telemetryWhere("l", query, cohort)
+	// uniq for the two counted in the millions, uniqExact for the handful of
+	// releases, builds and updates an app has.
+	sql := sqlf(`
+		SELECT uniq(eas_client_id),
+		       uniqExactIf(app_version, app_version != ''),
+		       uniqExactIf(
+		           if(eas_build_id != '', eas_build_id, concat(app_version, '#', app_build_number)),
+		           eas_build_id != '' OR app_build_number != ''
+		       ),
+		       uniqExactIf(update_id, toString(update_id) != '%s'),
+		       uniq(session_id),
+		       countIf(is_event = 1),
+		       groupUniqArray(platform)
+		FROM (
+			SELECT any(m.eas_client_id) AS eas_client_id, any(m.app_version) AS app_version,
+			       any(m.app_build_number) AS app_build_number, any(m.eas_build_id) AS eas_build_id,
+			       any(m.update_id) AS update_id, any(m.session_id) AS session_id,
+			       any(m.platform) AS platform, 0 AS is_event
+			FROM observe_metrics m WHERE %s
+			GROUP BY %s
+			UNION ALL
+			SELECT any(l.eas_client_id), any(l.app_version), any(l.app_build_number),
+			       any(l.eas_build_id), any(l.update_id), any(l.session_id),
+			       any(l.platform), 1 AS is_event
+			FROM observe_logs l WHERE %s
+			GROUP BY l.content_key
+		)`, embeddedUpdateID, metricsWhere, dedupKey, logsWhere)
+	args := append(prependAppID(appID, metricsArgs), prependAppID(appID, logsArgs)...)
+	if err := e.clickhouse.Conn.QueryRow(ctx, sql, args...).Scan(
+		&summary.Users,
+		&summary.Releases,
+		&summary.Builds,
+		&summary.Updates,
+		&summary.Sessions,
+		&summary.Events,
+		&summary.Platforms,
+	); err != nil {
+		return fmt.Errorf("reading observe summary: %w", err)
+	}
+	return nil
+}
+
+func metricDefinition(name string) MetricDefinition {
+	for _, definition := range observedMetricDefinitions {
+		if definition.Name == name {
+			return definition
+		}
+	}
+	label := strings.TrimPrefix(name, "expo.unknown.")
+	label = strings.ReplaceAll(label, "_", " ")
+	id := strings.NewReplacer(".", "-", "/", "-", " ", "-").Replace(name)
+	return MetricDefinition{
+		ID:    id,
+		Name:  name,
+		Label: label,
+		Description: "Reported by your app under a name expo-observe does not map to a known " +
+			"timing, so it is shown exactly as it arrived.",
+		Unit:       "s",
+		Category:   "custom",
+		MinimumSDK: 55,
+	}
+}
+
+func (e *Explorer) readMetricStats(ctx context.Context, appID string, query ExplorerQuery, cohort bool) ([]MetricSeries, error) {
+	where, args := telemetryWhere("m", query, cohort)
+	conditionWhere, conditionArgs := conditionsWhere(query.Conditions)
+	where += conditionWhere
+	args = append(args, conditionArgs...)
+	source, sourceArgs := metricsSource(appID, query, "")
+	// uniq, not uniqExact: this is the "N devices" of a caption, not an exact count.
+	sql := sqlf(`
+		SELECT metric_name, count(), toFloat64(quantileTDigest(0.5)(value)), avg(value),
+		       min(value), max(value), toFloat64(quantileTDigest(0.9)(value)),
+		       toFloat64(quantileTDigest(0.99)(value)), uniq(eas_client_id),
+		       max(has_conditions)
+		FROM (
+			SELECT any(m.metric_name) AS metric_name,
+			       any(m.eas_client_id) AS eas_client_id,
+			       any(m.value) AS value,
+			       any(JSONHas(m.custom_params, 'expo.device.thermalState')) AS has_conditions
+			FROM %s
+			WHERE %s
+			GROUP BY m.content_key
+		)
+		GROUP BY metric_name
+		ORDER BY count() DESC, metric_name
+		LIMIT 100`, source, where)
+	rows, err := e.clickhouse.Conn.Query(ctx, sql,
+		append(sourceArgs, prependAppID(appID, args)...)...)
+	if err != nil {
+		return nil, fmt.Errorf("reading observe metric stats: %w", err)
+	}
+	defer rows.Close()
+	metrics := make([]MetricSeries, 0)
+	for rows.Next() {
+		var name string
+		var stats MetricStats
+		if err := rows.Scan(
+			&name, &stats.Count, &stats.Median, &stats.Avg, &stats.Min,
+			&stats.Max, &stats.P90, &stats.P99, &stats.Devices,
+			&stats.ReportsConditions,
+		); err != nil {
+			return nil, err
+		}
+		metrics = append(metrics, MetricSeries{
+			MetricDefinition: metricDefinition(name),
+			Stats:            stats,
+			Points:           []ObserveMetricPoint{},
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Cards come back in the order the definitions are written, not by sample
+	// count. Anything unmapped keeps its place at the end, ranked by volume.
+	sort.SliceStable(metrics, func(i, j int) bool {
+		return definitionOrder(metrics[i].Name) < definitionOrder(metrics[j].Name)
+	})
+	return metrics, nil
+}
+
+// definitionOrder is where a metric sits in observedMetricDefinitions, or past
+// the end if it is not declared.
+func definitionOrder(name string) int {
+	for i, definition := range observedMetricDefinitions {
+		if definition.Name == name {
+			return i
+		}
+	}
+	return len(observedMetricDefinitions)
+}
+
+// names bounds the read to the series the caller will actually plot; empty
+// means it kept none, and there is nothing to ask.
+func (e *Explorer) readMetricPoints(
+	ctx context.Context,
+	appID string,
+	query ExplorerQuery,
+	cohort bool,
+	names []string,
+) (map[string][]ObserveMetricPoint, error) {
+	if len(names) == 0 {
+		return map[string][]ObserveMetricPoint{}, nil
+	}
+	where, args := telemetryWhere("m", query, cohort)
+	conditionWhere, conditionArgs := conditionsWhere(query.Conditions)
+	where += conditionWhere
+	args = append(args, conditionArgs...)
+	where += " AND m.metric_name IN ?"
+	args = append(args, names)
+	source, sourceArgs := metricsSource(appID, query, "")
+	sql := sqlf(`
+		SELECT metric_name,
+		       toStartOfInterval(timestamp, toIntervalSecond(?)) AS bucket,
+		       toFloat64(quantileTDigest(0.5)(value))
+		FROM (
+			SELECT any(m.metric_name) AS metric_name,
+			       any(m.timestamp) AS timestamp,
+			       any(m.value) AS value
+			FROM %s
+			WHERE %s
+			GROUP BY m.content_key
+		)
+		GROUP BY metric_name, bucket
+		ORDER BY metric_name, bucket`, source, where)
+	queryArgs := []any{uint64(max(int64(query.Bucket/time.Second), 1))}
+	queryArgs = append(queryArgs, sourceArgs...)
+	queryArgs = append(queryArgs, prependAppID(appID, args)...)
+	rows, err := e.clickhouse.Conn.Query(ctx, sql, queryArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("reading observe metric points: %w", err)
+	}
+	defer rows.Close()
+	points := map[string][]ObserveMetricPoint{}
+	for rows.Next() {
+		var name string
+		var point ObserveMetricPoint
+		if err := rows.Scan(&name, &point.Timestamp, &point.Value); err != nil {
+			return nil, err
+		}
+		points[name] = append(points[name], point)
+	}
+	return points, rows.Err()
+}
+
+func (e *Explorer) ReadEvents(ctx context.Context, appID string, query ExplorerQuery) (Events, error) {
+	return cachedRead(
+		ctx,
+		readCacheKey("events", appID, query),
+		func(ctx context.Context) (Events, error) { return e.readEvents(ctx, appID, query) })
+}
+
+func (e *Explorer) readEvents(ctx context.Context, appID string, query ExplorerQuery) (Events, error) {
+	events := Events{Available: e.clickhouse != nil, Events: []ObserveEventSeries{}}
+	if e.clickhouse == nil {
+		return events, nil
+	}
+	queryContext, resolved, empty, err := e.prepareTelemetryRead(ctx, appID, query)
+	if err != nil {
+		return Events{}, err
+	}
+	query = resolved
+	if empty {
+		return events, nil
+	}
+	cohort := len(query.MetadataFilter) > 0
+	where, args := telemetryWhere("l", query, cohort)
+	statsSQL := sqlf(`
+		SELECT event_name, count(), uniqExact(eas_client_id), uniqExact(session_id)
+		FROM (
+			SELECT l.event_name, l.eas_client_id, l.session_id
+			FROM observe_logs l
+			WHERE %s
+			GROUP BY l.event_name, l.eas_client_id, l.session_id, l.timestamp, l.content_key
+		)
+		GROUP BY event_name
+		ORDER BY count() DESC, event_name
+		LIMIT 50`, where)
+	rows, err := e.clickhouse.Conn.Query(queryContext, statsSQL, prependAppID(appID, args)...)
+	if err != nil {
+		return Events{}, fmt.Errorf("reading Observe event stats: %w", err)
+	}
+	for rows.Next() {
+		var event ObserveEventSeries
+		if err := rows.Scan(&event.Name, &event.Count, &event.Users, &event.Sessions); err != nil {
+			rows.Close()
+			return Events{}, err
+		}
+		event.Points = []ObserveEventPoint{}
+		events.Events = append(events.Events, event)
+	}
+	if err := rows.Close(); err != nil {
+		return Events{}, err
+	}
+	if len(events.Events) == 0 {
+		return events, nil
+	}
+
+	names := make([]string, 0, len(events.Events))
+	index := make(map[string]*ObserveEventSeries, len(events.Events))
+	for i := range events.Events {
+		names = append(names, events.Events[i].Name)
+		index[events.Events[i].Name] = &events.Events[i]
+	}
+	pointsSQL := sqlf(`
+		SELECT event_name,
+		       toStartOfInterval(timestamp, toIntervalSecond(?)) AS bucket,
+		       count()
+		FROM (
+			SELECT l.event_name, l.timestamp
+			FROM observe_logs l
+			WHERE %s AND l.event_name IN ?
+			GROUP BY l.event_name, l.eas_client_id, l.session_id, l.timestamp, l.content_key
+		)
+		GROUP BY event_name, bucket
+		ORDER BY event_name, bucket`, where)
+	queryArgs := []any{uint64(max(int64(query.Bucket/time.Second), 1))}
+	queryArgs = append(queryArgs, prependAppID(appID, args)...)
+	queryArgs = append(queryArgs, names)
+	pointRows, err := e.clickhouse.Conn.Query(queryContext, pointsSQL, queryArgs...)
+	if err != nil {
+		return Events{}, fmt.Errorf("reading Observe event points: %w", err)
+	}
+	defer pointRows.Close()
+	for pointRows.Next() {
+		var name string
+		var point ObserveEventPoint
+		if err := pointRows.Scan(&name, &point.Timestamp, &point.Count); err != nil {
+			return Events{}, err
+		}
+		if event := index[name]; event != nil {
+			event.Points = append(event.Points, point)
+		}
+	}
+	return events, pointRows.Err()
+}
+
+// MetricDefinitions lists the timings this server knows how to report on.
+// Custom metric names are discovered from the data, not from this list.
+func MetricDefinitions() []MetricDefinition {
+	return append([]MetricDefinition(nil), observedMetricDefinitions...)
+}

@@ -1,0 +1,6 @@
+{
+  "apps": [
+    {"slug": "consumer", "name": "Consumer Mobile"},
+    {"slug": "merchant", "name": "Merchant Mobile"}
+  ]
+}

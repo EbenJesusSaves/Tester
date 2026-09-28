@@ -1,0 +1,45 @@
+@startuml
+title Multi-app OTA deployment (production topology)
+skinparam componentStyle uml2
+node "iOS / Android device" as device {
+  artifact "Native app\nexpo-updates + pinned app certificate" as client
+}
+node "Protected CI runner" as ci {
+  artifact "Exported release\napp + channel + runtime + platform" as release
+}
+node "Edge network" {
+  node "TLS ingress\nrate and body limits" as ingress
+  node "Asset CDN" as cdn
+}
+node "Private service network" {
+  node "xprem replicas" as replicas {
+    component "Delivery API" as delivery
+    component "Publishing / dashboard API" as control
+    component "Signing and release services" as services
+  }
+  database "PostgreSQL\napp-scoped authoritative state" as db
+  database "Redis\nshared cache and coordination" as redis
+  storage "Private object store\napp ID / content hash" as bucket
+  artifact "Secret manager\nJWT and key-encryption key" as secrets
+}
+client --> ingress : HTTPS manifest / assets
+client --> cdn : HTTPS immutable assets
+release --> ingress : HTTPS publish + app credential
+ingress --> delivery : public routes
+ingress --> control : private admin / CI routes
+delivery --> services
+control --> services
+services --> db : private TLS
+services --> redis : private TLS
+services --> bucket : scoped storage identity
+services --> secrets : read only
+cdn --> bucket : authenticated origin access
+note bottom of ingress
+  Never cache manifests.
+  Do not expose metrics or administration publicly.
+end note
+note bottom of replicas
+  Local Compose uses one replica and local assets.
+  Multiple replicas require shared object storage and Redis.
+end note
+@enduml

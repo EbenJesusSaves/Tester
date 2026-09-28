@@ -1,0 +1,45 @@
+name: OTA security and mobile examples
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check reachable Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+      - name: Validate deployment files
+        run: |
+          python3 -m py_compile scripts/ota-init.py scripts/ota-bootstrap.py scripts/ota-smoke.py scripts/ota-e2e.py
+          sh -n deploy/ota/entrypoint.sh
+          python3 scripts/ota-init.py --admin-email ota-ci@example.test
+          docker compose --env-file deploy/ota/.env -f deploy/ota/compose.yaml config --quiet
+
+  mobile-examples:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/mobile
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: examples/mobile/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test

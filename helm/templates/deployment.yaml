@@ -1,0 +1,135 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "xprem.fullname" . }}
+  labels:
+    {{- include "xprem.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "xprem.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- if or .Values.podAnnotations .Values.secretEnv }}
+      annotations:
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.secretEnv }}
+        checksum/secret-env: {{ .Values.secretEnv | toYaml | sha256sum }}
+        {{- end }}
+      {{- end }}
+      labels:
+        {{- include "xprem.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "xprem.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 3000
+          # /hc is liveness: it answers 200 as soon as the process is up, even
+          # while a bucket migration is still running, so the orchestrator
+          # never kills a pod in the middle of a long migration. /ready flips
+          # to 200 only once migrations are done and the real router is
+          # mounted, which is what keeps traffic away until then.
+          livenessProbe:
+            httpGet:
+              path: /hc
+              port: 3000
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          env:
+            {{- if eq (index .Values.podAnnotations "prometheus.io/scrape") "true" }}
+            - name: PROMETHEUS_ENABLED
+              value: "true"
+              {{- else }}
+            - name: PROMETHEUS_ENABLED
+              value: "false"
+              {{- end }}
+            {{- range $env := .Values.environment }}
+              {{- $isRequired := true }}
+              {{- $isEnabled := true }}
+              {{- if eq (typeOf $env.required) "bool" }}
+                {{- $isRequired = $env.required }}
+              {{- else if hasKey $env "required" }}
+                {{- range $condition := $env.required }}
+                  {{- $keyValue := toString (index $.Values $condition.key) }}
+                  {{- if hasKey $condition "in" }}
+                    {{- if not (has $keyValue $condition.in) }}
+                      {{- $isRequired = false }}
+                    {{- end }}
+                  {{- else if or (not $keyValue) (ne $keyValue (toString $condition.is)) }}
+                    {{- $isRequired = false }}
+                  {{- end }}
+                {{- end }}
+              {{- end }}
+              {{- $isEnabled = $isRequired }}
+              {{- if hasKey $env "enabled" }}
+                {{- if eq (typeOf $env.enabled) "bool" }}
+                  {{- $isEnabled = $env.enabled }}
+                {{- else }}
+                  {{- $isEnabled = true }}
+                  {{- range $condition := $env.enabled }}
+                    {{- $keyValue := toString (index $.Values $condition.key) }}
+                    {{- if hasKey $condition "in" }}
+                      {{- if not (has $keyValue $condition.in) }}
+                        {{- $isEnabled = false }}
+                      {{- end }}
+                    {{- else if or (not $keyValue) (ne $keyValue (toString $condition.is)) }}
+                      {{- $isEnabled = false }}
+                    {{- end }}
+                  {{- end }}
+                {{- end }}
+              {{- end }}
+              {{- if $isEnabled }}
+                {{- if $env.computed }}
+            - name: {{ $env.name }}
+              value: "{{ index $.Values $env.key }}"
+                {{- else if $.Values.secretName }}
+            - name: {{ $env.name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: {{ $env.name }}
+                  {{- if not $isRequired }}
+                  optional: true
+                  {{- end }}
+                {{- else if or $isRequired $env.value }}
+            - name: {{ $env.name }}
+              value: "{{ $env.value }}"
+                {{- end }}
+              {{- end }}
+            {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.dnsConfig }}
+      dnsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

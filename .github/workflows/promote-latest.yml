@@ -1,0 +1,42 @@
+name: Promote release to latest
+
+# Manually promotes an already-released version to the "latest" Docker tag,
+# on the canonical xprem image and the deprecated expo-open-ota path.
+# The release workflow never touches "latest" anymore.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Stable release tag to promote (e.g. v3.0.0)"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag }}
+    steps:
+      - name: Validate tag
+        run: |
+          if ! echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Only stable tags (vX.Y.Z) can be promoted to latest, got: $TAG"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Tag Docker image as latest in every namespace
+        run: |
+          for REPO in "ghcr.io/${{ github.repository_owner }}/xprem" \
+                      "ghcr.io/${{ github.repository_owner }}/expo-open-ota"; do
+            docker buildx imagetools create -t "$REPO:latest" "$REPO:$TAG"
+          done

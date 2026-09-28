@@ -1,0 +1,104 @@
+{
+  "name": "eoas",
+  "version": "2.3.0",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "watch": "tsc --project tsconfig.json --watch",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "homepage": "https://github.com/mercuretechnologies/xprem/tree/main/eoas",
+  "keywords": [
+    "xprem",
+    "expo",
+    "eas",
+    "cli"
+  ],
+  "author": "Axel Marciano",
+  "license": "MIT",
+  "description": "A CLI tool to manage publishing and OTA updates for the xprem self-hosted server. This is not an official tool from Expo but an open-source project (https://github.com/mercuretechnologies/xprem)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mercuretechnologies/xprem.git"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.11.0",
+    "@expo/code-signing-certificates": "^0.0.5",
+    "@expo/config": "10.0.11",
+    "@expo/config-plugins": "9.0.12",
+    "@expo/fingerprint": "^0.11.7",
+    "@expo/package-manager": "1.7.0",
+    "@expo/spawn-async": "1.7.2",
+    "@oclif/core": "^4.2.4",
+    "@types/node-fetch": "^2.6.12",
+    "@urql/core": "4.0.11",
+    "@urql/exchange-retry": "1.2.0",
+    "better-opn": "3.0.2",
+    "chalk": "4.1.2",
+    "eslint": "^8.57.1",
+    "fast-glob": "3.3.2",
+    "fetch-retry": "^6.0.0",
+    "figures": "3.2.0",
+    "file-type": "^20.0.0",
+    "form-data": "^4.0.1",
+    "fs-extra": "11.2.0",
+    "getenv": "1.0.0",
+    "graphql": "16.8.1",
+    "graphql-tag": "^2.12.6",
+    "https-proxy-agent": "5.0.1",
+    "ignore": "5.3.0",
+    "joi": "17.11.0",
+    "js-yaml": "^5.2.2",
+    "jscodeshift": "^17.1.2",
+    "log-symbols": "^4.0.0",
+    "mime": "3.0.0",
+    "node-fetch": "^2.6.7",
+    "prettier": "3.1.1",
+    "prompts": "^2.4.2",
+    "recast": "^0.23.9",
+    "resolve-from": "5.0.0",
+    "semver": "7.5.4",
+    "tar": "6.2.1",
+    "terminal-link": "2.1.1",
+    "uuid": "9.0.1"
+  },
+  "devDependencies": {
+    "@babel/parser": "^7.26.7",
+    "@babel/types": "^7.26.7",
+    "@tsconfig/node18": "^18.2.4",
+    "@types/fs-extra": "11.0.4",
+    "@types/getenv": "^1.0.0",
+    "@types/js-yaml": "^4.0.9",
+    "@types/jscodeshift": "^0.12.0",
+    "@types/mime": "^3.0.4",
+    "@types/node": "^18.19.74",
+    "@types/prompts": "^2.4.9",
+    "@types/semver": "7.5.6",
+    "@types/tar": "6.1.10",
+    "@types/uuid": "9.0.7",
+    "eslint-config-universe": "^14.0.0",
+    "eslint-plugin-async-protect": "^3.1.0",
+    "eslint-plugin-node": "^11.1.0",
+    "ts-node": "10.9.2",
+    "typescript": "5.3.3",
+    "vitest": "^2.1.9"
+  },
+  "bin": {
+    "eoas": "bin/run.js"
+  },
+  "oclif": {
+    "bin": "eoas",
+    "commands": "./dist/commands",
+    "dirname": "eoas",
+    "topicSeparator": ":"
+  },
+  "files": [
+    "/bin",
+    "/dist",
+    "/THIRD_PARTY_NOTICES"
+  ]
+}

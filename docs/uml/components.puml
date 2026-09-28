@@ -1,0 +1,47 @@
+@startuml
+title xprem OTA components and interfaces
+skinparam componentStyle uml2
+actor "Release operator / CI" as publisher
+actor "Mobile runtime" as mobile
+package "HTTP boundary" {
+  component "Publishing and dashboard routes" as routes
+  component "Credential and app authorization" as auth
+  component "Expo protocol handlers" as handlers
+}
+package "Application services" {
+  component "App / channel administration" as administration
+  component "Upload validation and finalization" as upload
+  component "Update and rollout selection" as selection
+  component "Manifest composition and signing" as signing
+  component "Asset resolution" as assets
+}
+package "Infrastructure adapters" {
+  component "App-scoped repositories" as repositories
+  component "Cache" as cache
+  component "Object store" as store
+  component "Key store" as keys
+  component "CDN URL signer" as cdn
+}
+publisher --> routes : authenticated management API
+routes --> auth
+auth --> administration
+auth --> upload
+mobile --> handlers : Expo Updates protocol
+handlers --> selection
+handlers --> signing
+handlers --> assets
+administration --> repositories
+upload --> repositories
+upload --> store
+selection --> repositories
+selection --> cache
+signing --> keys
+signing --> cache
+assets --> store
+assets --> cdn
+assets --> cache
+note bottom of auth
+  App token authorization is server side.
+  Delivery app/channel headers are public selectors.
+end note
+@enduml

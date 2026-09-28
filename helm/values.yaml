@@ -1,0 +1,697 @@
+# Default values for xprem.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1 # Do not use more than 1 replica if storageMode is set to local
+
+image:
+  repository: ghcr.io/mercuretechnologies/xprem
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+    # eks.amazonaws.com/role-arn: "arn:aws:iam::..."
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: "xprem-sa"
+
+secretName: "xprem-secrets" # If set, environment variables will be read from this secret, else they will be read from the values.yaml file or passed in via the helm command line
+
+# Environment values the chart itself turns into the secretName Secret. Leave
+# empty to manage that Secret out of band (kubectl, external-secrets...).
+# `eoas server:init` generates a secrets.yaml overlay holding this map; deploy
+# with `-f values.yaml -f secrets.yaml`. Changing a value re-rolls the pods
+# through the checksum/secret-env pod annotation.
+secretEnv: {}
+storageMode: "s3"
+keysStorageType: "aws-secrets-manager"
+useCloudfrontRedirect: "false"
+useAWSAccessKeys: "false"
+useGenericCDN: "false"
+cacheMode: "redis"
+useDashboard: "false"
+useRedisTLS: "false"
+# Set to "true" when the server sits behind a trusted proxy or ingress so the
+# client IP used for API-token IP allowlists is read from X-Forwarded-For
+# instead of the proxy's connection address. Behind an ingress (the usual Helm
+# setup) leave this on; only enable it when the server is reachable exclusively
+# through that proxy, since a direct client could otherwise forge the header.
+trustProxyHeaders: "false"
+# Number of trusted proxies in front of the server, used only when
+# trustProxyHeaders is "true". The client IP is read that many entries from the
+# right of X-Forwarded-For, so a single ingress uses 1, a CDN in front of a load
+# balancer uses 2, and so on. Set it to the exact number of proxies you control:
+# too low reads an intermediate proxy IP, too high would trust a client-supplied
+# entry.
+trustProxyDepth: "1"
+# Enterprise audit log archive (requires controlPlane="true" and an enterprise
+# license). Set to "true" to periodically export the audit log as NDJSON files
+# to a DEDICATED bucket: the *_AUDIT_LOGS_* destination var matching
+# storageMode then becomes required and must differ from the updates
+# destination. Deploy the same value to every replica; a replica left on
+# "false" purges expired rows by age without waiting for the exporter.
+archiveAuditLogs: "false"
+# Set to "true" to compute bsdiff patches between successive updates at publish
+# and serve them to devices that ask for one, instead of the full bundle. Needs
+# the control plane. Patches are served by the server itself, not the CDN.
+bundleDiffing: "false"
+# Set to "true" to redirect patch downloads to the CDN instead of serving them
+# from the server. Only with CloudFront or a CDN_BASE_URL edge, which must add
+# the "im: bsdiff" and "expo-base-update-id" response headers on */bsdiff/*
+# objects; see the bundle diffing documentation for the per-provider snippets.
+bundleDiffingCDNRedirect: "false"
+# Set to "true" to run the server as a Control Plane (DB mode): apps live in
+# Postgres and are created/managed from the dashboard instead of the single
+# flat-env app. Requires DB_URL and exactly one control-plane master key (see
+# the env vars below). When "false" the server is single-app (stateless) and
+# the flat EXPO_APP_ID / EXPO_ACCESS_TOKEN / key vars are used.
+# See https://github.com/mercuretechnologies/xprem/blob/main/apps/docs/docs/advanced/multi-app.mdx
+controlPlane: "false"
+# Where the DB keys master key comes from when controlPlane="true": "environment"
+# renders DB_KEYS_MASTER_KEY_B64, "aws-secrets-manager" renders
+# AWSSM_DB_KEYS_MASTER_KEY_SECRET_ID. Independent of keysStorageType, which only
+# describes the stateless app's own signing keys and is not rendered at all in
+# control-plane mode. Ignored when controlPlane="false".
+dbKeysMasterKeySource: "environment"
+
+environment:
+  - name: "USE_DASHBOARD"
+    key: "useDashboard"
+    required: true
+    computed: true
+  - name: "ADMIN_EMAIL"
+    value: ""
+    required:
+      - key: "useDashboard"
+        is: "true"
+  - name: "ADMIN_PASSWORD"
+    value: ""
+    required:
+      - key: "useDashboard"
+        is: "true"
+  # "true" redirects / to the dashboard login instead of returning 404. Off by
+  # default so the root of a public OTA domain does not point at the admin UI.
+  - name: "DASHBOARD_ROOT_REDIRECT"
+    value: ""
+    enabled:
+      - key: "useDashboard"
+        is: "true"
+    required: false
+  - name: "CACHE_MODE"
+    key: "cacheMode"
+    required: true
+    computed: true
+  - name: "REDIS_SENTINEL_ADDRS"
+    value: ""
+    required:
+      - key: "cacheMode"
+        is: "redis-sentinel"
+  - name: "REDIS_SENTINEL_MASTER_NAME"
+    value: "mymaster"
+    required: false
+    enabled:
+      - key: "cacheMode"
+        is: "redis-sentinel"
+  - name: "REDIS_HOST"
+    value: ""
+    required:
+      - key: "cacheMode"
+        is: "redis"
+  - name: "REDIS_PORT"
+    value: ""
+    required:
+      - key: "cacheMode"
+        is: "redis"
+  - name: "REDIS_USE_TLS"
+    value: "true"
+    required:
+      - key: "cacheMode"
+        in:
+          - "redis"
+          - "redis-sentinel"
+      - key: "useRedisTLS"
+        is: "true"
+  - name: "REDIS_PASSWORD"
+    value: ""
+    required:
+      - key: "cacheMode"
+        is: "redis"
+    enabled:
+      - key: "cacheMode"
+        in:
+          - "redis"
+          - "redis-sentinel"
+  - name: "REDIS_USERNAME"
+    value: ""
+    required: false
+    enabled:
+      - key: "cacheMode"
+        in:
+          - "redis"
+          - "redis-sentinel"
+  - name: "REDIS_CA_CERT_B64"
+    value: ""
+    required: false
+    enabled:
+      - key: "cacheMode"
+        in:
+          - "redis"
+          - "redis-sentinel"
+      - key: "useRedisTLS"
+        is: "true"
+  # Optional prefix on every cache key, for a Redis shared with other apps.
+  - name: "CACHE_KEY_PREFIX"
+    value: ""
+    enabled: true
+    required: false
+  - name: "STORAGE_MODE"
+    key: "storageMode"
+    required: true
+    computed: true
+  - name: "GCS_BUCKET_NAME"
+    value: ""
+    required:
+      - key: "storageMode"
+        is: "gcs"
+  - name: "GOOGLE_APPLICATION_CREDENTIALS_B64"
+    value: ""
+    required:
+      - key: "storageMode"
+        is: "gcs"
+  - name: "AZURE_BLOB_CONTAINER_NAME"
+    value: ""
+    required:
+      - key: "storageMode"
+        is: "azure"
+  - name: "AZURE_STORAGE_ACCOUNT_NAME"
+    value: ""
+    required:
+      - key: "storageMode"
+        is: "azure"
+  - name: "AZURE_STORAGE_ACCOUNT_KEY"
+    value: ""
+    required:
+      - key: "storageMode"
+        is: "azure"
+  # Optional blob service URL override (Azurite, private endpoints).
+  - name: "AZURE_BLOB_ENDPOINT"
+    value: ""
+    enabled:
+      - key: "storageMode"
+        is: "azure"
+    required: false
+  - name: "AWS_ACCESS_KEY_ID"
+    value: ""
+    required:
+      - key: "useAWSAccessKeys"
+        is: "true"
+  - name: "AWS_SECRET_ACCESS_KEY"
+    value: ""
+    required:
+      - key: "useAWSAccessKeys"
+        is: "true"
+  - name: "AWS_REGION"
+    value: ""
+    required:
+      - key: "storageMode"
+        is: "s3"
+  # `required: false` alone never renders an env var (the template treats a
+  # non-required, non-enabled entry as disabled), so every optional var below
+  # also carries `enabled: true`.
+  - name: "AWS_BASE_ENDPOINT"
+    value: ""
+    enabled: true
+    required: false
+  - name: "AWS_S3_FORCE_PATH_STYLE"
+    value: ""
+    enabled: true
+    required: false
+  - name: "S3_BUCKET_NAME"
+    value: ""
+    required:
+      - key: "storageMode"
+        is: "s3"
+  # Set to "true" to stop redirecting asset requests to presigned S3 URLs and
+  # keep streaming assets through the server, for buckets on an endpoint the
+  # devices cannot reach (a MinIO on a private network).
+  - name: "DISABLE_S3_DIRECT_CDN"
+    value: ""
+    enabled: true
+    required: false
+  # Set to "true" to let clients send prevent-cdn-redirection: true and make
+  # this server stream that request instead of redirecting it to the CDN.
+  # Any asset client can use it once enabled, increasing origin traffic.
+  - name: "ENABLE_PREVENT_CDN_REDIRECTION_HEADER"
+    value: ""
+    enabled: true
+    required: false
+  - name: "BUCKET_KEY_PREFIX"
+    value: ""
+    enabled: true
+    required: false
+  # TODO: remove S3_KEY_PREFIX once users have migrated to BUCKET_KEY_PREFIX
+  - name: "S3_KEY_PREFIX"
+    value: ""
+    enabled: true
+    required: false
+  # Parallelism of the one-shot v2 bucket re-path on remote backends
+  # (default 16).
+  - name: "BUCKET_MIGRATION_CONCURRENCY"
+    value: ""
+    enabled: true
+    required: false
+  # Base URL of a CDN fronting the storage bucket. Works with any cloud
+  # storage mode; the bucket must be publicly readable. Optional so that
+  # deployments migrating from the deprecated S3_CDN_PREFIX can keep either
+  # key in their secret.
+  - name: "CDN_BASE_URL"
+    value: ""
+    enabled:
+      - key: "useGenericCDN"
+        is: "true"
+    required: false
+  # TODO: remove S3_CDN_PREFIX once users have migrated to CDN_BASE_URL
+  - name: "S3_CDN_PREFIX"
+    value: ""
+    enabled:
+      - key: "useGenericCDN"
+        is: "true"
+    required: false
+  - name: "LOCAL_BUCKET_BASE_PATH"
+    value: ""
+    required:
+      - key: "storageMode"
+        is: "local"
+  - name: "CLOUDFRONT_DOMAIN"
+    value: ""
+    required:
+      - key: "useCloudfrontRedirect"
+        is: "true"
+  - name: "CLOUDFRONT_KEY_PAIR_ID"
+    value: ""
+    required:
+      - key: "useCloudfrontRedirect"
+        is: "true"
+  - name: "PRIVATE_CLOUDFRONT_KEY_PATH"
+    value: ""
+    required:
+      - key: "useCloudfrontRedirect"
+        is: "true"
+      - key: "keysStorageType"
+        is: "local"
+  - name: "AWSSM_CLOUDFRONT_PRIVATE_KEY_SECRET_ID"
+    value: ""
+    required:
+      - key: "useCloudfrontRedirect"
+        is: "true"
+      - key: "keysStorageType"
+        is: "aws-secrets-manager"
+  # Per-app identity and signing keys for the single-app stateless mode. They
+  # are REQUIRED when controlPlane="false", but still rendered (as optional)
+  # in control-plane mode: a v2 deploy upgrading into the control plane must
+  # keep them set so the one-shot legacy import can find the flat-env app,
+  # re-path its bucket data under the app id and seal its signing keys into
+  # the database, and so that v1 clients sending no expo-app-id header keep
+  # resolving to that app. Only a control plane created from scratch leaves
+  # them unset.
+  - name: "KEYS_STORAGE_TYPE"
+    key: "keysStorageType"
+    computed: true
+    enabled: true
+    required:
+      - key: "controlPlane"
+        is: "false"
+  - name: "AWSSM_EXPO_PUBLIC_KEY_SECRET_ID"
+    value: ""
+    enabled:
+      - key: "keysStorageType"
+        is: "aws-secrets-manager"
+    required:
+      - key: "controlPlane"
+        is: "false"
+      - key: "keysStorageType"
+        is: "aws-secrets-manager"
+  - name: "AWSSM_EXPO_PRIVATE_KEY_SECRET_ID"
+    value: ""
+    enabled:
+      - key: "keysStorageType"
+        is: "aws-secrets-manager"
+    required:
+      - key: "controlPlane"
+        is: "false"
+      - key: "keysStorageType"
+        is: "aws-secrets-manager"
+  - name: "PUBLIC_LOCAL_EXPO_KEY_PATH"
+    value: ""
+    enabled:
+      - key: "keysStorageType"
+        is: "local"
+    required:
+      - key: "controlPlane"
+        is: "false"
+      - key: "keysStorageType"
+        is: "local"
+  - name: "PRIVATE_LOCAL_EXPO_KEY_PATH"
+    value: ""
+    enabled:
+      - key: "keysStorageType"
+        is: "local"
+    required:
+      - key: "controlPlane"
+        is: "false"
+      - key: "keysStorageType"
+        is: "local"
+  - name: "PUBLIC_EXPO_KEY_B64"
+    value: ""
+    enabled:
+      - key: "keysStorageType"
+        is: "environment"
+    required:
+      - key: "controlPlane"
+        is: "false"
+      - key: "keysStorageType"
+        is: "environment"
+  - name: "PRIVATE_EXPO_KEY_B64"
+    value: ""
+    enabled:
+      - key: "keysStorageType"
+        is: "environment"
+    required:
+      - key: "controlPlane"
+        is: "false"
+      - key: "keysStorageType"
+        is: "environment"
+  # CloudFront key is a server-wide signing key — it is NOT per app — so it
+  # stays required whenever CloudFront is enabled.
+  - name: "PRIVATE_CLOUDFRONT_KEY_B64"
+    value: ""
+    required:
+      - key: "keysStorageType"
+        is: "environment"
+  - name: "BASE_URL"
+    value: ""
+    required: true
+  - name: "TRUST_PROXY_HEADERS"
+    key: "trustProxyHeaders"
+    required: true
+    computed: true
+  - name: "TRUST_PROXY_DEPTH"
+    key: "trustProxyDepth"
+    computed: true
+    enabled:
+      - key: "trustProxyHeaders"
+        is: "true"
+  # Enterprise audit log. Retention defaults to 550 days server-side when
+  # unset; the export interval defaults to 300 seconds (minimum 10).
+  - name: "AUDIT_LOG_RETENTION_DAYS"
+    value: ""
+    enabled: true
+    required: false
+  - name: "ARCHIVE_AUDIT_LOGS"
+    key: "archiveAuditLogs"
+    required: true
+    computed: true
+  - name: "AUDIT_LOGS_EXPORT_INTERVAL_SECONDS"
+    value: ""
+    required: false
+    enabled:
+      - key: "archiveAuditLogs"
+        is: "true"
+  # Bundle diffing. The two tuning values default server-side to 64 MB and
+  # 0.3 when unset. A patch job peaks at about six times the maximum bundle
+  # size and two run at once, so leave the server that much memory headroom.
+  - name: "BUNDLE_DIFFING"
+    key: "bundleDiffing"
+    required: true
+    computed: true
+  - name: "BUNDLE_DIFFING_CDN_REDIRECT"
+    key: "bundleDiffingCDNRedirect"
+    computed: true
+    enabled:
+      - key: "bundleDiffing"
+        is: "true"
+  - name: "BUNDLE_DIFFING_MAX_BUNDLE_SIZE_MB"
+    value: ""
+    required: false
+    enabled:
+      - key: "bundleDiffing"
+        is: "true"
+  - name: "BUNDLE_DIFFING_PATCH_MAX_RATIO"
+    value: ""
+    required: false
+    enabled:
+      - key: "bundleDiffing"
+        is: "true"
+  - name: "S3_BUCKET_AUDIT_LOGS_NAME"
+    value: ""
+    required:
+      - key: "archiveAuditLogs"
+        is: "true"
+      - key: "storageMode"
+        is: "s3"
+  - name: "GCS_BUCKET_AUDIT_LOGS_NAME"
+    value: ""
+    required:
+      - key: "archiveAuditLogs"
+        is: "true"
+      - key: "storageMode"
+        is: "gcs"
+  - name: "AZURE_BLOB_AUDIT_LOGS_CONTAINER_NAME"
+    value: ""
+    required:
+      - key: "archiveAuditLogs"
+        is: "true"
+      - key: "storageMode"
+        is: "azure"
+  # The local base path only matters for the single-replica local storage
+  # mode; the server defaults it to ./audit-logs when unset.
+  - name: "LOCAL_AUDIT_LOGS_BASE_PATH"
+    value: ""
+    required: false
+    enabled:
+      - key: "archiveAuditLogs"
+        is: "true"
+      - key: "storageMode"
+        is: "local"
+  # EXPO_ACCESS_TOKEN and EXPO_APP_ID follow the same rule as the key vars
+  # above: required in stateless mode, still rendered (optional) in
+  # control-plane mode. EXPO_APP_ID in particular is what backward
+  # compatibility hangs on when upgrading a v2 deploy: it drives the bucket
+  # re-path, the legacy import into the database, and the fallback that keeps
+  # serving v1 clients whose requests carry no expo-app-id header.
+  - name: "EXPO_ACCESS_TOKEN"
+    value: ""
+    enabled: true
+    required:
+      - key: "controlPlane"
+        is: "false"
+  - name: "EXPO_APP_ID"
+    value: ""
+    enabled: true
+    required:
+      - key: "controlPlane"
+        is: "false"
+  # Once every client in the field ships the expo-app-id header (v2+ builds
+  # only), set to "true" to stop routing header-less requests to the legacy
+  # EXPO_APP_ID app.
+  - name: "SKIP_LEGACY_APP_ID_FALLBACK"
+    value: ""
+    enabled: true
+    required: false
+  # Control Plane (DB mode). Rendered only when controlPlane="true". Set DB_URL
+  # and the master key, whose source is picked by dbKeysMasterKeySource. The
+  # master key seals per-app signing keys at rest — generate it with
+  # `openssl rand -base64 32`.
+  - name: "DB_URL"
+    value: ""
+    required:
+      - key: "controlPlane"
+        is: "true"
+  - name: "DB_KEYS_MASTER_KEY_B64"
+    value: ""
+    required:
+      - key: "controlPlane"
+        is: "true"
+      - key: "dbKeysMasterKeySource"
+        is: "environment"
+  - name: "AWSSM_DB_KEYS_MASTER_KEY_SECRET_ID"
+    value: ""
+    required:
+      - key: "controlPlane"
+        is: "true"
+      - key: "dbKeysMasterKeySource"
+        is: "aws-secrets-manager"
+  # Optional Postgres pool tuning (sensible defaults apply when unset).
+  - name: "DB_MAX_CONNS"
+    value: ""
+    required:
+      - key: "controlPlane"
+        is: "true"
+  - name: "DB_MIN_CONNS"
+    value: ""
+    required:
+      - key: "controlPlane"
+        is: "true"
+  - name: "DB_MAX_CONN_LIFETIME"
+    value: ""
+    required: false
+    enabled:
+      - key: "controlPlane"
+        is: "true"
+  - name: "DB_MAX_CONN_IDLE_TIME"
+    value: ""
+    required: false
+    enabled:
+      - key: "controlPlane"
+        is: "true"
+  # ClickHouse DSN the Observe feature persists telemetry through, e.g.
+  # clickhouse://user:password@host:9000/database. Requires controlPlane="true";
+  # unset leaves Observe (identity included) disabled.
+  - name: "CLICKHOUSE_URL"
+    value: ""
+    enabled: true
+    required: false
+  # Path to a GeoLite2 .mmdb file inside the container, used to locate devices
+  # in the Identity dashboard. Unset leaves devices unlocated.
+  - name: "GEOIP_MMDB_PATH"
+    value: ""
+    enabled: true
+    required: false
+  # Set to "true" to record nothing about the devices being served: no device
+  # registry, no update-health state, no telemetry ingestion. Updates are
+  # delivered exactly the same; the Observe and Identity dashboards report the
+  # feature as unavailable.
+  - name: "DISABLE_DEVICE_TELEMETRY"
+    value: ""
+    enabled: true
+    required: false
+  # Set to "true" to locate devices from the visitor-location headers your
+  # CDN or load balancer adds (Cloudflare, CloudFront, Vercel, Akamai, or the
+  # generic X-Geo-* set), instead of a local GeoIP database. Only enable it
+  # when the server is reachable exclusively through that proxy, since a
+  # direct client could otherwise forge its own location.
+  - name: "TRUST_GEOIP_HEADERS"
+    value: ""
+    enabled: true
+    required: false
+  # Explicit header names replacing the recognized catalog, for proxies that
+  # let you name the headers yourself.
+  - name: "GEOIP_HEADER_COUNTRY"
+    value: ""
+    enabled: true
+    required: false
+  - name: "GEOIP_HEADER_CITY"
+    value: ""
+    enabled: true
+    required: false
+  - name: "GEOIP_HEADER_LATITUDE"
+    value: ""
+    enabled: true
+    required: false
+  - name: "GEOIP_HEADER_LONGITUDE"
+    value: ""
+    enabled: true
+    required: false
+  # MaxMind account credentials (free GeoLite2 account). When both are set the
+  # server downloads the GeoLite2 City database itself at startup, so devices
+  # get located on the Identity dashboard without mounting any file.
+  # TRUST_GEOIP_HEADERS wins when both approaches are configured.
+  - name: "MAXMIND_ACCOUNT_ID"
+    value: ""
+    enabled: true
+    required: false
+  - name: "MAXMIND_LICENSE_KEY"
+    value: ""
+    enabled: true
+    required: false
+  # Directory the downloaded database is cached in (defaults to the user
+  # cache dir; set it when the filesystem is read-only except for a volume).
+  - name: "GEOIP_CACHE_DIR"
+    value: ""
+    enabled: true
+    required: false
+  - name: "JWT_SECRET"
+    value: ""
+    required: true
+
+
+podAnnotations: {}
+    # prometheus.io/scrape: "true"
+    # prometheus.io/path: "/metrics"
+    # prometheus.io/port: "3000"
+
+podSecurityContext: {}
+# fsGroup: 2000
+
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+# runAsNonRoot: true
+# runAsUser: 1000
+
+service:
+  type: ClusterIP
+  port: 3000
+
+ingress:
+  enabled: true
+  className: ""
+  annotations:
+      # kubernetes.io/ingress.class: nginx
+      # nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+      # nginx.ingress.kubernetes.io/proxy-body-size: 100m
+      # nginx.ingress.kubernetes.io/ingress.allow-http: "false"
+      # nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      # nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+      # nginx.ingress.kubernetes.io/configuration-snippet: |
+      #  proxy_set_header True-Client-IP $remote_addr;
+      # nginx.ingress.kubernetes.io/server-snippet: |
+      # location ~* "^/metrics" {
+      #        deny all;
+      #        return 403;
+      #  }
+      # kubernetes.io/tls-acme: "true"
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: chart-example-tls
+  #    hosts:
+  #      - chart-example.local
+
+resources: {}
+  # We usually recommend not to specify default resources and to leave this as a conscious
+  # choice for the user. This also increases chances charts run on environments with little
+  # resources, such as Minikube. If you do want to specify resources, uncomment the following
+  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
+  # limits:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # requests:
+#   cpu: 100m
+#   memory: 128Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}

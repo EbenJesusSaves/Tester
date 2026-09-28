@@ -1,0 +1,313 @@
+package services
+
+import (
+	"context"
+	"strconv"
+	"strings"
+	"xprem/config"
+	cache2 "xprem/internal/cache"
+	"xprem/internal/types"
+	update2 "xprem/internal/update"
+	"xprem/internal/version"
+)
+
+// The read-through caches of the update-delivery hot path: in steady state a
+// manifest or asset poll is answered without a single repository read.
+//
+// The short TTLs below are the freshness bound for operator changes: nothing
+// invalidates these keys. Signatures can live longer: their key embeds the
+// signing key fingerprint and the content hash, so a stale entry can never be
+// served.
+const (
+	signatureCacheTTLSeconds = 3600
+	appConfigCacheTTLSeconds = 10
+	// 5s keeps a channel remap or rollout promote near-instant for devices.
+	channelMappingCacheTTLSeconds = 5
+	// An update's type never changes once published; the TTL only reclaims
+	// storage.
+	updateTypeCacheTTLSeconds = update2.ImmutableCacheTTLSeconds
+	// An update's UUID hashes its id, branch and runtime version, so it can
+	// never designate another row. An unknown UUID is almost always the update
+	// embedded in the binary, which stays unknown; the short TTL only covers
+	// a lookup that raced a publish.
+	updateByUUIDCacheTTLSeconds        = update2.ImmutableCacheTTLSeconds
+	unknownUpdateByUUIDCacheTTLSeconds = 60
+	// A patch only disappears with its branch; a missing one is usually being
+	// computed by the job that the publish just enqueued.
+	patchExistsCacheTTLSeconds  = update2.ImmutableCacheTTLSeconds
+	missingPatchCacheTTLSeconds = 60
+	// Unlike its neighbours this key IS invalidated on write, but only where
+	// the cache is shared: with a local cache and several replicas, the write
+	// clears one process and the TTL bounds the rest.
+	channelBranchSurfingCacheTTLSeconds = 30
+	// Every launch of every build carrying the picker reads the branch list, so
+	// this one absorbs a fleet-wide boot rather than operator edits. Short enough
+	// that a publish shows up the next time a tester opens the panel.
+	surfableBranchesCacheTTLSeconds = 15
+	// Publish and rollout writes do delete this key, but a delete only reaches
+	// the replica that handled the write; the TTL bounds every other one.
+	lastUpdateEnvelopeCacheTTLSeconds = 60
+)
+
+func appConfigCacheKey(appId string) string {
+	return cache2.Key("app-config", version.Version, appId)
+}
+
+func updateTypeCacheKey(update types.Update) string {
+	return cache2.Key("update-type", version.Version, update.AppId, update.Branch, update.RuntimeVersion, update.UpdateId)
+}
+
+func updateByUUIDCacheKey(appId string, updateUUID string) string {
+	return cache2.Key("update-by-uuid", version.Version, appId, updateUUID)
+}
+
+// These immutable fields are needed to validate asset pins and patch identity.
+// Cache positive reads so a warm download performs no extra database reads.
+func (s *ExpoProtocolService) cachedAssetPlatform(ctx context.Context, update types.Update) (types.Platform, error) {
+	key := cache2.Key("asset-platform", update2.ComputeMetadataCacheKey(update.AppId, update.Branch, update.RuntimeVersion, update.UpdateId))
+	store := cache2.GetCache()
+	if value := store.Get(key); value != "" {
+		return types.ParsePlatform(value)
+	}
+	metadata, err := s.updateRepo.RetrieveUpdateStoredMetadata(ctx, update)
+	if err != nil || metadata == nil {
+		return "", err
+	}
+	platform, err := types.ParsePlatform(string(metadata.Platform))
+	if err == nil {
+		ttl := update2.ImmutableCacheTTLSeconds
+		_ = store.Set(key, string(platform), &ttl)
+	}
+	return platform, err
+}
+
+func (s *ExpoProtocolService) cachedLaunchAssetHash(ctx context.Context, update types.Update) (string, error) {
+	key := cache2.Key("launch-asset-hash", update2.ComputeMetadataCacheKey(update.AppId, update.Branch, update.RuntimeVersion, update.UpdateId))
+	store := cache2.GetCache()
+	if value := store.Get(key); value != "" {
+		return value, nil
+	}
+	mapping, err := s.updateRepo.GetUpdateAssetMapping(ctx, update)
+	if err != nil || mapping == nil {
+		return "", err
+	}
+	if mapping.LaunchAsset.Hash != "" {
+		ttl := update2.ImmutableCacheTTLSeconds
+		_ = store.Set(key, mapping.LaunchAsset.Hash, &ttl)
+	}
+	return mapping.LaunchAsset.Hash, nil
+}
+
+func patchExistsCacheKey(appId, branch, targetUpdateUUID, sourceUpdateUUID string) string {
+	return cache2.Key("patch-exists", version.Version, appId, branch, targetUpdateUUID, sourceUpdateUUID)
+}
+
+func channelMappingCacheKey(appId string, channelName string) string {
+	return cache2.Key("channel-mapping", version.Version, appId, channelName)
+}
+
+func channelBranchSurfingCacheKey(appId string, channelName string) string {
+	return cache2.Key("channel-branch-surfing", version.Version, appId, channelName)
+}
+
+// Keyed without the channel: the list is per app, runtime version and platform,
+// and the channel's pattern filters it afterwards, so channels share one entry.
+// The platform belongs in the key, not just the query — an iOS answer served to
+// an Android device would offer branches it cannot be given.
+func surfableBranchesCacheKey(appId string, runtimeVersion string, platform types.Platform) string {
+	return cache2.Key("surfable-branches", version.Version, appId, runtimeVersion, string(platform))
+}
+
+func cachedSurfableBranches(ctx context.Context, branchRepo BranchRepository, appId string, runtimeVersion string, platform types.Platform) ([]types.SurfableBranch, error) {
+	branchCache := cache2.GetCache()
+	cacheKey := surfableBranchesCacheKey(appId, runtimeVersion, platform)
+	if branches, ok := cache2.GetJSON[[]types.SurfableBranch](branchCache, cacheKey); ok {
+		return branches, nil
+	}
+	branches, err := branchRepo.GetSurfableBranches(ctx, appId, runtimeVersion, platform)
+	if err != nil {
+		return nil, err
+	}
+	ttl := surfableBranchesCacheTTLSeconds
+	// An empty answer is cached too: a runtime version with nothing built for it
+	// is exactly the request an attacker repeats.
+	cache2.SetJSON(branchCache, cacheKey, branches, &ttl)
+	return branches, nil
+}
+
+func signatureCacheKey(appId string, keyFingerprint string, contentHash string) string {
+	return cache2.Key("manifest-signature", version.Version, appId, keyFingerprint, contentHash)
+}
+
+// carriesPlaintextSecret reports whether an app config holds material that
+// must never reach a shared cache: the Expo access token, or a signing key
+// passed in the clear through the environment. Sealed keys are encrypted with
+// the master key and secret ids and paths are references, not secrets.
+func carriesPlaintextSecret(appConfig config.AppConfig) bool {
+	return appConfig.AccessToken != "" || appConfig.Keys.PrivateB64 != ""
+}
+
+// cachedAppConfig is the hot-path read of an app: manifest and asset requests
+// go through it on every poll. Stateless mode skips the cache entirely: the
+// repo read is an in-memory map, and its configs carry plaintext secrets that
+// must never reach a shared cache anyway.
+func (s *ExpoProtocolService) cachedAppConfig(ctx context.Context, appId string) (config.AppConfig, error) {
+	if !config.IsDBMode() {
+		return s.appRepo.GetAppByID(ctx, appId)
+	}
+	appCache := cache2.GetCache()
+	if appConfig, ok := cache2.GetJSON[config.AppConfig](appCache, appConfigCacheKey(appId)); ok {
+		return appConfig, nil
+	}
+	appConfig, err := s.appRepo.GetAppByID(ctx, appId)
+	if err != nil {
+		return config.AppConfig{}, err
+	}
+	if carriesPlaintextSecret(appConfig) {
+		return appConfig, nil
+	}
+	ttl := appConfigCacheTTLSeconds
+	cache2.SetJSON(appCache, appConfigCacheKey(appId), appConfig, &ttl)
+	return appConfig, nil
+}
+
+func (s *ExpoProtocolService) cachedUpdateType(ctx context.Context, update types.Update) (types.UpdateType, error) {
+	typeCache := cache2.GetCache()
+	cacheKey := updateTypeCacheKey(update)
+	if cached := typeCache.Get(cacheKey); cached != "" {
+		if parsed, err := strconv.Atoi(cached); err == nil {
+			return types.UpdateType(parsed), nil
+		}
+	}
+	updateType, err := s.updateRepo.GetUpdateType(ctx, update)
+	if err != nil {
+		return 0, err
+	}
+	ttl := updateTypeCacheTTLSeconds
+	_ = typeCache.Set(cacheKey, strconv.Itoa(int(updateType)), &ttl)
+	return updateType, nil
+}
+
+// cachedUpdate is one UUID lookup; a nil Update records that the UUID is
+// unknown, so devices on the embedded update do not hit the repository.
+type cachedUpdate struct {
+	Update *types.Update `json:"update"`
+}
+
+func (s *ExpoProtocolService) cachedUpdateByUUID(ctx context.Context, appId string, updateUUID string) (*types.Update, error) {
+	updateCache := cache2.GetCache()
+	cacheKey := updateByUUIDCacheKey(appId, updateUUID)
+	if entry, ok := cache2.GetJSON[cachedUpdate](updateCache, cacheKey); ok {
+		return entry.Update, nil
+	}
+	update, err := s.updateRepo.GetUpdateByUUID(ctx, appId, updateUUID)
+	if err != nil {
+		return nil, err
+	}
+	ttl := updateByUUIDCacheTTLSeconds
+	if update == nil {
+		ttl = unknownUpdateByUUIDCacheTTLSeconds
+	}
+	cache2.SetJSON(updateCache, cacheKey, cachedUpdate{Update: update}, &ttl)
+	return update, nil
+}
+
+func (s *ExpoProtocolService) cachedPatchExists(ctx context.Context, appId, branch, targetUpdateUUID, sourceUpdateUUID string) (bool, error) {
+	existsCache := cache2.GetCache()
+	cacheKey := patchExistsCacheKey(appId, branch, targetUpdateUUID, sourceUpdateUUID)
+	if cached := existsCache.Get(cacheKey); cached != "" {
+		return cached == "1", nil
+	}
+	exists, err := s.patchStore.Exists(ctx, appId, branch, targetUpdateUUID, sourceUpdateUUID)
+	if err != nil {
+		return false, err
+	}
+	value, ttl := "0", missingPatchCacheTTLSeconds
+	if exists {
+		value, ttl = "1", patchExistsCacheTTLSeconds
+	}
+	_ = existsCache.Set(cacheKey, value, &ttl)
+	return exists, nil
+}
+
+func (s *ExpoProtocolService) channelBranchMapping(ctx context.Context, appId string, channelName string) (*types.ChannelResolution, error) {
+	return cachedChannelMapping(ctx, s.channelRepo, appId, channelName)
+}
+
+func cachedChannelMapping(ctx context.Context, channelRepo ChannelRepository, appId string, channelName string) (*types.ChannelResolution, error) {
+	if !config.IsDBMode() {
+		// The expo provider keeps its own cached, invalidated-on-remap entry;
+		// a second layer here would only delay remaps by its TTL.
+		return channelRepo.GetChannelBranchMapping(ctx, appId, channelName)
+	}
+	mappingCache := cache2.GetCache()
+	cacheKey := channelMappingCacheKey(appId, channelName)
+	if mapping, ok := cache2.GetJSON[types.ChannelResolution](mappingCache, cacheKey); ok {
+		return &mapping, nil
+	}
+	mapping, err := channelRepo.GetChannelBranchMapping(ctx, appId, channelName)
+	if err != nil || mapping == nil {
+		return mapping, err
+	}
+	ttl := channelMappingCacheTTLSeconds
+	cache2.SetJSON(mappingCache, cacheKey, mapping, &ttl)
+	return mapping, nil
+}
+
+// branchSurfingEnabled answers whether the channel lets devices ask for another
+// branch. It is on the manifest hot path, so it never fails the poll: any error,
+// and stateless mode where the setting does not exist, answer false.
+func (s *ExpoProtocolService) branchSurfingEnabled(ctx context.Context, appId string, channelName string) (bool, string) {
+	return cachedBranchSurfing(ctx, s.channelRepo, appId, channelName)
+}
+
+func cachedBranchSurfing(ctx context.Context, channelRepo ChannelRepository, appId string, channelName string) (bool, string) {
+	if !config.IsDBMode() || channelName == "" {
+		return false, ""
+	}
+	surfingCache := cache2.GetCache()
+	cacheKey := channelBranchSurfingCacheKey(appId, channelName)
+	// "<0|1>:<pattern>". A value without the separator predates this format, so
+	// it falls through to the read below, which rewrites it.
+	if cached := surfingCache.Get(cacheKey); cached != "" {
+		if enabled, pattern, ok := strings.Cut(cached, ":"); ok {
+			return enabled == "1", pattern
+		}
+	}
+	surfing, err := channelRepo.GetBranchSurfing(ctx, appId, channelName)
+	if err != nil {
+		// Deliberately not cached: an error is not an answer, and caching one
+		// would keep a channel dark for the whole TTL after the database
+		// recovers. Costs a read per poll only while the database is down.
+		return false, ""
+	}
+	ttl := channelBranchSurfingCacheTTLSeconds
+	if surfing == nil {
+		// A channel that does not exist is cached exactly like one with surfing
+		// off. Leaving it uncached made the two observably different: the
+		// disabled channel answered from memory and the unknown one hit
+		// Postgres, so response time told an unauthenticated caller which
+		// channel names exist — and let it drive an unbounded read per request.
+		_ = surfingCache.Set(cacheKey, boolCacheValue(false)+":", &ttl)
+		return false, ""
+	}
+	_ = surfingCache.Set(cacheKey, boolCacheValue(surfing.Enabled)+":"+surfing.Pattern, &ttl)
+	return surfing.Enabled, surfing.Pattern
+}
+
+// ForgetBranchSurfing drops the delivery-path entry a setting write stales.
+// Best effort: see channelBranchSurfingCacheTTLSeconds.
+func ForgetBranchSurfing(appId string, channelName string) {
+	cache2.GetCache().Delete(channelBranchSurfingCacheKey(appId, channelName))
+}
+
+func ForgetSurfableBranches(appId string, runtimeVersion string, platform types.Platform) {
+	cache2.GetCache().Delete(surfableBranchesCacheKey(appId, runtimeVersion, platform))
+}
+
+func boolCacheValue(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
+}

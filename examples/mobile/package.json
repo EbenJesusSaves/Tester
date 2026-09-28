@@ -1,0 +1,21 @@
+{
+  "name": "xprem-mobile-integration-examples",
+  "private": true,
+  "description": "Typechecked integration examples; copy these into your existing Expo application.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test ota-controller.test.ts"
+  },
+  "dependencies": {
+    "expo": "57.0.25",
+    "expo-updates": "57.0.23",
+    "react": "19.2.3",
+    "react-native": "0.86.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "@types/react": "^19.2.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
